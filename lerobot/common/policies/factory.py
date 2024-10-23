@@ -25,9 +25,7 @@ from lerobot.common.utils.utils import get_safe_torch_device
 def _policy_cfg_from_hydra_cfg(policy_cfg_class, hydra_cfg):
     expected_kwargs = set(inspect.signature(policy_cfg_class).parameters)
     if not set(hydra_cfg.policy).issuperset(expected_kwargs):
-        logging.warning(
-            f"Hydra config is missing arguments: {set(expected_kwargs).difference(hydra_cfg.policy)}"
-        )
+        logging.warning(f"Hydra config is missing arguments: {set(expected_kwargs).difference(hydra_cfg.policy)}")
 
     # OmegaConf.to_container returns lists where sequences are found, but our dataclasses use tuples to avoid
     # issues with mutable defaults. This filter changes all lists to tuples.
@@ -35,11 +33,7 @@ def _policy_cfg_from_hydra_cfg(policy_cfg_class, hydra_cfg):
         return tuple(item) if isinstance(item, list) else item
 
     policy_cfg = policy_cfg_class(
-        **{
-            k: list_to_tuple(v)
-            for k, v in OmegaConf.to_container(hydra_cfg.policy, resolve=True).items()
-            if k in expected_kwargs
-        }
+        **{k: list_to_tuple(v) for k, v in OmegaConf.to_container(hydra_cfg.policy, resolve=True).items() if k in expected_kwargs}
     )
     return policy_cfg
 
@@ -66,13 +60,16 @@ def get_policy_and_config_classes(name: str) -> tuple[Policy, object]:
         from lerobot.common.policies.vqbet.modeling_vqbet import VQBeTPolicy
 
         return VQBeTPolicy, VQBeTConfig
+    elif name == "arp":
+        from lerobot.common.policies.arp.network import ARPConfig
+        from lerobot.common.policies.arp.network import ARPPolicy
+
+        return ARPPolicy, ARPConfig
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
 
-def make_policy(
-    hydra_cfg: DictConfig, pretrained_policy_name_or_path: str | None = None, dataset_stats=None
-) -> Policy:
+def make_policy(hydra_cfg: DictConfig, pretrained_policy_name_or_path: str | None = None, dataset_stats=None) -> Policy:
     """Make an instance of a policy class.
 
     Args:
@@ -86,9 +83,7 @@ def make_policy(
             policy. Therefore, this argument is mutually exclusive with `pretrained_policy_name_or_path`.
     """
     if not (pretrained_policy_name_or_path is None) ^ (dataset_stats is None):
-        raise ValueError(
-            "Exactly one of `pretrained_policy_name_or_path` and `dataset_stats` must be provided."
-        )
+        raise ValueError("Exactly one of `pretrained_policy_name_or_path` and `dataset_stats` must be provided.")
 
     policy_cls, policy_cfg_class = get_policy_and_config_classes(hydra_cfg.policy.name)
 
