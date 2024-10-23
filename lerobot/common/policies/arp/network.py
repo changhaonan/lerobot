@@ -200,12 +200,6 @@ class ARPNetwork(nn.Module):
         """
         num_guide_points = self.num_guide_points
         horizon = self.horizon
-        if self.training:
-            batch = self._preprocess(batch)
-            assert (
-                num_guide_points == batch["visual_guide"].shape[1]
-            ), f"Number of guide points mismatch: {num_guide_points} vs {batch['visual_guide'].shape[1]}"
-            assert horizon == batch["action"].shape[1], f"Horizon mismatch: {horizon} vs {batch['action'].shape[1]}"
         dev = batch["observation.images"].device
 
         images = batch["observation.images"][:, 0, 0]  # [bs, 3, 512, 512]
@@ -282,26 +276,7 @@ class ARPNetwork(nn.Module):
                 contexts={"visual-tokens": visual_tokens, "visual-featmap": visual_featmap, "prompt-features": global_feat},
                 sample=True,
             )
-            return pred_tks[:, num_guide_points + 1 :, :-1]
-
-    def _preprocess(self, batch):
-        bs = batch["action"].shape[0]
-        proj = batch["observation.camera_proj.front"].reshape(bs, 3, 4)
-        action_points = batch["action"][:, :, :3]
-        action_points = torch.cat([action_points, torch.ones((bs, action_points.shape[1], 1), device=action_points.device)], dim=-1)
-        proj_p = torch.matmul(proj, action_points.permute(0, 2, 1)).permute(0, 2, 1)
-        proj_p = proj_p[:, :, :2] / (proj_p[:, :, 2:] + 1e-6)
-        batch["visual_guide"] = proj_p[:, : self.num_guide_points, :]
-        # [DEBUG]
-        # import cv2
-        # for i in range(bs):
-        #     img = batch["observation.images.front"][i, 0].cpu().numpy().transpose(1, 2, 0)
-        #     img = (img * 255).astype(np.uint8)
-        #     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        #     for j in range(self.num_guide_points):
-        #         cv2.circle(img, tuple(proj_p[i, j].int().tolist()), 5, (0, 255, 0), -1)
-        #     cv2.imwrite(f"debug_{i}.png", img)
-        return batch
+            return {"visual_guide": pred_tks[:, :num_guide_points, :2], "action": pred_tks[:, num_guide_points + 1 :, :-1]}
 
 
 @dataclass
@@ -403,6 +378,8 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
 
     def forward(self, batch: dict[str, Tensor]) -> dict:
         """Run the batch through the model and compute the loss for training or validation."""
+        if self.training:
+            batch = self._preprocess(batch)
         batch = self.normalize_inputs(batch)
         if len(self.expected_image_keys) > 0:
             batch = dict(batch)
@@ -413,6 +390,8 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
+        if self.training:
+            batch = self._preprocess(batch)
         batch = self.normalize_inputs(batch)
         if len(self.expected_image_keys) > 0:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -423,7 +402,7 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
         if len(self._queues["action"]) == 0:
             # stack n latest observations from the queue
             batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-            actions = self.model(batch)
+            actions = self.model(batch)["action"]
 
             # Chunk action
             actions = self.unnormalize_outputs({"action": actions})["action"]
@@ -435,18 +414,25 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
         action = self._queues["action"].popleft()
         return action
 
+    def _preprocess(self, batch):
+        bs = batch["action"].shape[0]
+        proj = batch["observation.camera_proj.front"].reshape(bs, 3, 4)
+        action_points = batch["action"][:, :, :3]
+        action_points = torch.cat([action_points, torch.ones((bs, action_points.shape[1], 1), device=action_points.device)], dim=-1)
+        proj_p = torch.matmul(proj, action_points.permute(0, 2, 1)).permute(0, 2, 1)
+        proj_p = proj_p[:, :, :2] / (proj_p[:, :, 2:] + 1e-6)
+        batch["visual_guide"] = proj_p[:, : self.model.num_guide_points, :]
+        # [DEBUG]
+        # import cv2
 
-# def make_policy_arp(hydra_cfg: DictConfig, pretrained_policy_name_or_path: str | None = None, dataset_stats=None):
-#     if pretrained_policy_name_or_path is None:
-#         policy = ARPPolicy(hydra_cfg.policy, dataset_stats)
-#     else:
-#         policy = ARPPolicy(hydra_cfg.policy)
-#         policy.load_state_dict(
-#             ARPPolicy.from_pretrained(pretrained_policy_name_or_path).state_dict(),
-#         )
-#     # ARPNetwork(**OmegaConf.to_container(hydra_cfg.policy, resolve=True))
-#     policy.to(hydra_cfg.device)
-#     return policy
+        # for i in range(bs):
+        #     img = batch["observation.images.front"][i, 0].cpu().numpy().transpose(1, 2, 0)
+        #     img = (img * 255).astype(np.uint8)
+        #     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        #     for j in range(self.model.num_guide_points):
+        #         cv2.circle(img, tuple(proj_p[i, j].int().tolist()), 5, (0, 255, 0), -1)
+        #     cv2.imwrite(f"debug_{i}.png", img)
+        return batch
 
 
 if __name__ == "__main__":

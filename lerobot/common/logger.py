@@ -21,6 +21,8 @@
 import logging
 import os
 import re
+import cv2
+import numpy as np
 from glob import glob
 from pathlib import Path
 
@@ -199,14 +201,8 @@ class Logger:
     ):
         """Checkpoint the model weights and the training state."""
         checkpoint_dir = self.checkpoints_dir / str(identifier)
-        wandb_artifact_name = (
-            None
-            if self._wandb is None
-            else f"{self._group.replace(':', '_').replace('/', '_')}-{self._cfg.seed}-{identifier}"
-        )
-        self.save_model(
-            checkpoint_dir / self.pretrained_model_dir_name, policy, wandb_artifact_name=wandb_artifact_name
-        )
+        wandb_artifact_name = None if self._wandb is None else f"{self._group.replace(':', '_').replace('/', '_')}-{self._cfg.seed}-{identifier}"
+        self.save_model(checkpoint_dir / self.pretrained_model_dir_name, policy, wandb_artifact_name=wandb_artifact_name)
         self.save_training_state(checkpoint_dir, train_step, optimizer, scheduler)
         os.symlink(checkpoint_dir.absolute(), self.last_checkpoint_dir)
 
@@ -220,9 +216,7 @@ class Logger:
         if scheduler is not None:
             scheduler.load_state_dict(training_state["scheduler"])
         elif "scheduler" in training_state:
-            raise ValueError(
-                "The checkpoint contains a scheduler state_dict, but no LRScheduler was provided."
-            )
+            raise ValueError("The checkpoint contains a scheduler state_dict, but no LRScheduler was provided.")
         # Small hack to get the expected keys: use `get_global_random_state`.
         set_global_random_state({k: training_state[k] for k in get_global_random_state()})
         return training_state["step"]
@@ -233,9 +227,7 @@ class Logger:
         if self._wandb is not None:
             for k, v in d.items():
                 if not isinstance(v, (int, float, str)):
-                    logging.warning(
-                        f'WandB logging of key "{k}" was ignored as its type is not handled by this wrapper.'
-                    )
+                    logging.warning(f'WandB logging of key "{k}" was ignored as its type is not handled by this wrapper.')
                     continue
                 self._wandb.log({f"{mode}/{k}": v}, step=step)
 
@@ -244,3 +236,20 @@ class Logger:
         assert self._wandb is not None
         wandb_video = self._wandb.Video(video_path, fps=self._cfg.fps, format="mp4")
         self._wandb.log({f"{mode}/video": wandb_video}, step=step)
+
+    ###################################### ARP-related methods ######################################
+    def log_visual_guide(self, images, visual_guide, step: int, mode: str = "train"):
+        assert mode in {"train", "eval"}
+        # assert self._wandb is not None
+        # Draw image
+        bs = images.shape[0]
+        num_guide_points = visual_guide.shape[1]
+        for i in range(bs):
+            img = images[i, 0].transpose(1, 2, 0)
+            img = (img * 255).astype(np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            for j in range(num_guide_points):
+                cv2.circle(img, tuple(visual_guide[i, j, :2].astype(np.int32).tolist()), 5, (0, 255, 0), -1)
+            # cv2.imwrite(f"debug_{i}.png", img)
+
+        self._wandb.log({f"{mode}/visual_guide": visual_guide}, step=step)
