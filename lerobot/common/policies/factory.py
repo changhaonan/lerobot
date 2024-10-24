@@ -61,8 +61,11 @@ def get_policy_and_config_classes(name: str) -> tuple[Policy, object]:
 
         return VQBeTPolicy, VQBeTConfig
     elif name == "arp":
-        from lerobot.common.policies.arp.network import ARPConfig
-        from lerobot.common.policies.arp.network import ARPPolicy
+        # from lerobot.common.policies.arp.network import ARPConfig
+        # from lerobot.common.policies.arp.network import ARPPolicy
+        # Get version 2
+        from lerobot.common.policies.arp.network_v2 import ARPConfig
+        from lerobot.common.policies.arp.network_v2 import ARPPolicy
 
         return ARPPolicy, ARPConfig
     else:

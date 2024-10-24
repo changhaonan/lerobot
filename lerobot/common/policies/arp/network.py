@@ -276,7 +276,8 @@ class ARPNetwork(nn.Module):
                 contexts={"visual-tokens": visual_tokens, "visual-featmap": visual_featmap, "prompt-features": global_feat},
                 sample=True,
             )
-            return {"visual_guide": pred_tks[:, :num_guide_points, :2], "action": pred_tks[:, num_guide_points + 1 :, :-1]}
+            visual_guide = pred_tks[:, :num_guide_points, :2] * self.visual_guide_downsample
+            return {"visual_guide": visual_guide, "action": pred_tks[:, num_guide_points + 1 :, :-1]}
 
 
 @dataclass

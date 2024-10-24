@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 from glob import glob
 from pathlib import Path
-
+from PIL import Image as PILImage
 import torch
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from omegaconf import DictConfig, OmegaConf
@@ -240,16 +240,19 @@ class Logger:
     ###################################### ARP-related methods ######################################
     def log_visual_guide(self, images, visual_guide, step: int, mode: str = "train"):
         assert mode in {"train", "eval"}
-        # assert self._wandb is not None
+        assert self._wandb is not None
         # Draw image
         bs = images.shape[0]
         num_guide_points = visual_guide.shape[1]
-        for i in range(bs):
+        log_images = []
+        for i in range(min(bs, 4)):
             img = images[i, 0].transpose(1, 2, 0)
             img = (img * 255).astype(np.uint8)
             img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             for j in range(num_guide_points):
                 cv2.circle(img, tuple(visual_guide[i, j, :2].astype(np.int32).tolist()), 5, (0, 255, 0), -1)
-            # cv2.imwrite(f"debug_{i}.png", img)
-
-        self._wandb.log({f"{mode}/visual_guide": visual_guide}, step=step)
+            pil_image = PILImage.fromarray(img, mode="RGB")
+            self._wandb.log({f"{mode}/visual_guide_vis": self._wandb.Image(pil_image, caption=f"Image {i}")}, step=step)
+            # log_images.append(self._wandb.Image(pil_image, caption=f"Image {i}"))
+        # self._wandb.log({f"{mode}/visual_guide": log_images}, step=step)
+        pass

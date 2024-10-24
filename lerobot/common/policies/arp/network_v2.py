@@ -18,6 +18,7 @@ from lerobot.common.policies.utils import (
 from dataclasses import dataclass, field
 from huggingface_hub import PyTorchModelHubMixin
 from omegaconf import DictConfig, OmegaConf
+from torchvision.transforms.functional import to_pil_image
 from lerobot.common.policies.arp.common import (
     draw_keypoints,
     denormalize_bchw_image,
@@ -28,6 +29,8 @@ from lerobot.common.policies.arp.common import (
     augmentation_recipe,
     normalize_bchw_image,
 )
+import cv2
+import random
 
 
 class ARPNetwork(nn.Module):
@@ -42,6 +45,7 @@ class ARPNetwork(nn.Module):
         n_arp_layers=4,
         visual_guide_downsample=4,
         horizon=15,
+        **kwargs,
     ):
         super().__init__()
         backbone_model = getattr(torchvision.models, "resnet18")(
@@ -112,7 +116,7 @@ class ARPNetwork(nn.Module):
 
     def forward(self, batch):
         """
-        observation.images.front: (bs, 1, 3, 512, 512)
+        observation.images.front: (bs, 1, 3, H, W)
         action_is_pad: (bs, L)
 
         # label
@@ -120,11 +124,10 @@ class ARPNetwork(nn.Module):
         gripper_open: (bs, L)
         """
         horizon = self.horizon
-        if self.training:
-            batch = self._preprocess(batch)
+        # Convert original batch to action in image.
         dev = batch["observation.images.front"].device
 
-        images = batch["observation.images.front"][:, 0]  # [bs, 3, 512, 512]
+        images = batch["observation.images.front"][:, 0]  # [bs, 3, H, W]
         H, W = images.shape[-2:]
         visual_features = self.backbone(images)["feature_map"]
         bs, _, fh, fw = visual_features.shape
@@ -149,7 +152,7 @@ class ARPNetwork(nn.Module):
         if self.training:
             visual_featmap = visual_featmap.repeat(1, horizon, 1, 1, 1).flatten(0, 1)
             vH, vW = H // self.visual_guide_downsample, W // self.visual_guide_downsample
-            tk_is_pad_mask = batch["action_is_pad"].unsqueeze(-1).repeat(1, 1, 5).flatten(1, 2)
+            # tk_is_pad_mask = batch["action_is_pad"].unsqueeze(-1).repeat(1, 1, 5).flatten(1, 2)
             contexts = {"visual-tokens": visual_tokens, "visual-featmap": visual_featmap}
 
             actions = {}
@@ -166,10 +169,10 @@ class ARPNetwork(nn.Module):
             chk_ids = torch.as_tensor(chk_ids, device=dev)[None, :]
             tk_ids = torch.as_tensor(tk_ids).to(dev)[None, :, None].repeat(bs, 1, 1)
             tks = torch.cat([tk_vals, tk_ids], dim=-1)
+            # FIXME: fix it later
+            loss_dict = self.policy.compute_loss(tks, chk_ids, contexts=contexts)  # , valid_tk_mask=~tk_is_pad_mask
 
-            loss_dict = self.policy.compute_loss(tks, chk_ids, contexts=contexts, valid_tk_mask=~tk_is_pad_mask)
-
-            DEBUG = True
+            DEBUG = False
             if DEBUG:
                 images = denormalize_bchw_image(images)
                 visualized_images = []
@@ -177,7 +180,10 @@ class ARPNetwork(nn.Module):
                     img = to_pil_image(images[bi])
                     img = draw_keypoints(img, actions["o"][bi].detach().cpu() * self.visual_guide_downsample)
                     visualized_images.append(img)
-            return loss_dict, visualized_images
+                loss_dict["visualized_images"] = visualized_images
+            # Compute a sum loss
+            loss_dict["loss"] = sum([v for k, v in loss_dict.items() if "loss" in k])
+            return loss_dict
         else:
             prompt_tks = torch.zeros(bs, 0, 3, device=dev)
             future_tk_chk_ids = [{"tk_id": tk_id, "chk_id": chk_id} for tk_id, chk_id in zip(tk_ids, chk_ids)]
@@ -186,17 +192,20 @@ class ARPNetwork(nn.Module):
             )
             # at this moment, the pred tks are visual actions only
             keypoints = pred_tks[:, ::5, :-1] * self.visual_guide_downsample
+            gt_keypoints = batch["origin"]
             images = denormalize_bchw_image(images)
             visualized_images = []
             for bi in range(bs):
                 img = to_pil_image(images[bi])
-                img = draw_keypoints(img, keypoints[bi].detach().cpu())
+                img = draw_keypoints(img, keypoints[bi].detach().cpu(), colors=(255, 0, 0))
+                # draw gt keypoints
+                img = draw_keypoints(img, gt_keypoints[bi].detach().cpu(), colors=(0, 255, 0))
                 visualized_images.append(img)
 
-            return pred_tks, visualized_images
-
-    def _preprocess(self, batch):
-        pass
+            return {
+                "action": pred_tks,
+                "visualized_images": visualized_images,
+            }
 
 
 ######################################## For lerobot ########################################
@@ -275,11 +284,11 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
             n_heads=config.n_heads,
             n_encoder_layers=config.n_encoder_layers,
             n_arp_layers=config.n_arp_layers,
-            # num_gmm_latents=config.num_gmm_latents,
-            # action_from_glb_only=config.action_from_glb_only,
+            num_gmm_latents=config.num_gmm_latents,
+            action_from_glb_only=config.action_from_glb_only,
             visual_guide_downsample=config.visual_guide_downsample,
             horizon=config.horizon,
-            # num_guide_points=config.num_guide_points,
+            num_guide_points=config.num_guide_points,
         )
         self.expected_image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
         self.use_env_state = "observation.environment_state" in config.input_shapes
@@ -319,7 +328,7 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
         if len(self._queues["action"]) == 0:
             # stack n latest observations from the queue
             batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-            actions = self.model(batch)
+            actions = self.model(batch)["action"]
 
             # Chunk action
             actions = self.unnormalize_outputs({"action": actions})["action"]
@@ -332,6 +341,70 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
         return action
 
 
+#################################### Wrap augmentation into a function ####################################
+# count = 0
+
+
+def ImageActionAug(data, aug_prob=0.5):
+    """Project action to image-points."""
+    horizon = len(data["action"])
+    intrinsics = data["observation.camera_int.front"].reshape(3, 3).numpy().astype(np.float64)
+    extrinsics = data["observation.camera_ext.front"].reshape(4, 4).numpy().astype(np.float64)
+    extrinsics = np.linalg.inv(extrinsics)
+    extrinsics[0] = -extrinsics[0]
+    aug_transform = augmentation_recipe(spatial=1.0, color=0.0, mask=1.0, hflip=0, vflip=0, normalize=True, keypoints=True, to_tensor=True)
+
+    rotations = Rotation.from_euler("XYZ", data["action"][:, 3:6], degrees=False)
+    pose7 = np.concatenate([data["action"][:, :3], rotations.as_quat()], axis=1)
+    frames = pose7_to_frame(pose7)
+    frames2d = cv2.projectPoints(frames.reshape(-1, 3), extrinsics[:3, :3], extrinsics[:3, 3], intrinsics, None)[0].reshape(horizon, 4, 2)
+
+    # THIS IMAGE is ranged in [0...1], or [0...255]
+    if random.random() < aug_prob:
+        _ = aug_transform(image=data["observation.images.front"][0].permute(1, 2, 0).numpy(), keypoints=frames2d.reshape(-1, 2))
+        aug_image = _["image"]
+        # FIXME: there is bug here.
+        if len(_["keypoints"]) == (9 * horizon * 4):
+            _["keypoints"] = _["keypoints"][4 * (horizon * 4) : 5 * (horizon * 4)]
+            # global count
+            # count += 1
+            # draw_keypoints(to_pil_image(denormalize_bchw_image(_["image"])[0]), _["keypoints"]).save(f"bad.{count}.png")
+
+        aug_frames2d = _["keypoints"].reshape(horizon, 4, 2)
+        aug_frames2d = torch.from_numpy(aug_frames2d.clip(0, 511))
+        # Assemble new data
+        aug_data = {
+            "observation.images.front": aug_image[None, ...],
+            "action": data["action"],
+            "action_is_pad": data["action_is_pad"],
+            "observation.camera_ext.front": data["observation.camera_ext.front"],
+            "observation.camera_int.front": data["observation.camera_int.front"],
+            "observation.state": data["observation.state"],
+            "gripper_open": data["action"][:, -1] >= 0.02,
+            "origin": aug_frames2d[:, 0],
+            "xaxis": aug_frames2d[:, 1],
+            "yaxis": aug_frames2d[:, 2],
+            "zaxis": aug_frames2d[:, 3],
+        }
+        return aug_data
+    else:
+        frames2d = torch.from_numpy(frames2d)
+        new_data = {
+            "observation.images.front": normalize_bchw_image(data["observation.images.front"]),
+            "action": data["action"],
+            "action_is_pad": data["action_is_pad"],
+            "observation.camera_ext.front": data["observation.camera_ext.front"],
+            "observation.camera_int.front": data["observation.camera_int.front"],
+            "observation.state": data["observation.state"],
+            "gripper_open": data["action"][:, -1] >= 0.02,
+            "origin": frames2d[:, 0],
+            "xaxis": frames2d[:, 1],
+            "yaxis": frames2d[:, 2],
+            "zaxis": frames2d[:, 3],
+        }
+        return new_data
+
+
 if __name__ == "__main__":
     import cv2
     import numpy as np
@@ -342,71 +415,78 @@ if __name__ == "__main__":
         "observation.camera_ext.front": [0.0],
         "observation.camera_int.front": [0.0],
         "observation.state": [0.0],
-        "action": [0.0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24, 0.28, 0.32, 0.36, 0.4, 0.44, 0.48, 0.52, 0.56],
+        "action": [0.04 * i for i in range(16)],
     }
 
     dataset = LeRobotDataset(
-        "changhaonan/RPLBenchData", split="train", delta_timestamps=delta_timestamps, image_transforms=None, video_backend="pyav", root="."
+        "changhaonan/RPLBenchDataEval",
+        split="train",
+        delta_timestamps=delta_timestamps,
+        image_transforms=None,
+        video_backend="pyav",
+        root="/home/harvey/Project/LGMCTSpp/log/Oct_23_1",
     )
+    data_loader = torch.utils.data.DataLoader(dataset, batch_size=32, num_workers=0, shuffle=False)
+    policy = ARPPolicy(ARPConfig(), dataset_stats=None)
+    policy.train()
+    output = policy.forward(next(iter(data_loader)))
+    # horizon = len(data["action"])
+    # intrinsics = data["observation.camera_int.front"][0].reshape(3, 3).numpy().astype(np.float64)
+    # extrinsics = data["observation.camera_ext.front"][0].reshape(4, 4).numpy().astype(np.float64)
+    # extrinsics = np.linalg.inv(extrinsics)
+    # extrinsics[0] = -extrinsics[0]
+    # aug_transform = augmentation_recipe(spatial=1.0, color=0.0, mask=1.0, hflip=0, vflip=0, normalize=True, keypoints=True, to_tensor=True)
 
-    data = dataset[0]
-    horizon = len(data["action"])
-    intrinsics = data["observation.camera_int.front"][0].reshape(3, 3).numpy().astype(np.float64)
-    extrinsics = data["observation.camera_ext.front"][0].reshape(4, 4).numpy().astype(np.float64)
-    extrinsics = np.linalg.inv(extrinsics)
-    extrinsics[0] = -extrinsics[0]
-    aug_transform = augmentation_recipe(spatial=1.0, color=0.0, mask=1.0, hflip=0, vflip=0, normalize=True, keypoints=True, to_tensor=True)
+    # rotations = Rotation.from_euler("xyz", data["action"][:, 3:6], degrees=False)
+    # pose7 = np.concatenate([data["action"][:, :3], rotations.as_quat()], axis=1)
+    # frames = pose7_to_frame(pose7)
+    # frames2d = cv2.projectPoints(frames.reshape(-1, 3), extrinsics[:3, :3], extrinsics[:3, 3], intrinsics, None)[0].reshape(horizon, 4, 2)
 
-    rotations = Rotation.from_euler("xyz", data["action"][:, 3:6], degrees=False)
-    pose7 = np.concatenate([data["action"][:, :3], rotations.as_quat()], axis=1)
-    frames = pose7_to_frame(pose7)
-    frames2d = cv2.projectPoints(frames.reshape(-1, 3), extrinsics[:3, :3], extrinsics[:3, 3], intrinsics, None)[0].reshape(horizon, 4, 2)
+    # # THIS IMAGE is ranged in [0...1], or [0...255]
+    # _ = aug_transform(image=data["observation.images.front"][0].permute(1, 2, 0).numpy(), keypoints=frames2d.reshape(-1, 2))
+    # aug_image = _["image"]
+    # aug_frames2d = _["keypoints"].reshape(horizon, 4, 2)
+    # aug_frames2d = torch.from_numpy(aug_frames2d.clip(0, 511))
+    # frames2d = torch.from_numpy(frames2d)
 
-    # THIS IMAGE is ranged in [0...1], or [0...255]
-    _ = aug_transform(image=data["observation.images.front"][0].permute(1, 2, 0).numpy(), keypoints=frames2d.reshape(-1, 2))
-    aug_image = _["image"]
-    aug_frames2d = _["keypoints"].reshape(horizon, 4, 2)
-    aug_frames2d = torch.from_numpy(aug_frames2d.clip(0, 511))
-    frames2d = torch.from_numpy(frames2d)
+    # origin_batch = {
+    #     "observation.images.front": normalize_bchw_image(data["observation.images.front"])[None],
+    #     "action_is_pad": data["action_is_pad"][None],
+    #     "gripper_open": data["action"][None, :, -1] >= 0.02,
+    #     "origin": frames2d[None, :, 0],
+    #     "xaxis": frames2d[None, :, 1],
+    #     "yaxis": frames2d[None, :, 2],
+    #     "zaxis": frames2d[None, :, 3],
+    # }
 
-    origin_batch = {
-        "observation.images.front": normalize_bchw_image(data["observation.images.front"])[None],
-        "action_is_pad": data["action_is_pad"][None],
-        "gripper_open": data["action"][None, :, -1] >= 0.02,
-        "origin": frames2d[None, :, 0],
-        "xaxis": frames2d[None, :, 1],
-        "yaxis": frames2d[None, :, 2],
-        "zaxis": frames2d[None, :, 3],
-    }
+    # aug_batch = {
+    #     "observation.images.front": aug_image[None, None],
+    #     "action_is_pad": data["action_is_pad"][None],
+    #     "gripper_open": data["action"][None, :, -1] >= 0.02,
+    #     "origin": aug_frames2d[None, :, 0],
+    #     "xaxis": aug_frames2d[None, :, 1],
+    #     "yaxis": aug_frames2d[None, :, 2],
+    #     "zaxis": aug_frames2d[None, :, 3],
+    # }
 
-    aug_batch = {
-        "observation.images.front": aug_image[None, None],
-        "action_is_pad": data["action_is_pad"][None],
-        "gripper_open": data["action"][None, :, -1] >= 0.02,
-        "origin": aug_frames2d[None, :, 0],
-        "xaxis": aug_frames2d[None, :, 1],
-        "yaxis": aug_frames2d[None, :, 2],
-        "zaxis": aug_frames2d[None, :, 3],
-    }
+    # batch = {}
+    # for k in origin_batch.keys():
+    #     batch[k] = torch.cat([origin_batch[k], aug_batch[k]], dim=0)
 
-    batch = {}
-    for k in origin_batch.keys():
-        batch[k] = torch.cat([origin_batch[k], aug_batch[k]], dim=0)
+    # model = ARPNetwork()
+    # model.train()
 
-    model = ARPNetwork()
-    model.train()
+    # print("=== Training ===")
+    # log_dict, vis_images = model(batch)
+    # for i, img in enumerate(vis_images):
+    #     img.save(f"vis{i}.jpg")
 
-    print("=== Training ===")
-    log_dict, vis_images = model(batch)
-    for i, img in enumerate(vis_images):
-        img.save(f"vis{i}.jpg")
+    # print(log_dict)
 
-    print(log_dict)
+    # print("=== Inference ===")
+    # for k in ["action_is_pad", "gripper_open", "origin", "xaxis", "yaxis", "zaxis"]:
+    #     batch.pop(k)
 
-    print("=== Inference ===")
-    for k in ["action_is_pad", "gripper_open", "origin", "xaxis", "yaxis", "zaxis"]:
-        batch.pop(k)
-
-    with torch.no_grad():
-        model.eval()
-        pred_action, vis_images = model(batch)
+    # with torch.no_grad():
+    #     model.eval()
+    #     pred_action, vis_images = model(batch)
