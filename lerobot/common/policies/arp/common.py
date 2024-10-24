@@ -23,7 +23,7 @@ def augmentation_recipe(target_size=None, color=0.25, spatial=0.25, hflip=0.5, v
             A.Perspective(scale=(0.2, 0.4)),
             A.Rotate(limit=60),
         ],
-        p=spatial,
+        p=1.0,
     )
     T_spatial = A.OneOf(T_spatial, p=spatial)
 
