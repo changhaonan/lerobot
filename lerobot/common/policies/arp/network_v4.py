@@ -201,7 +201,7 @@ class ARPNetwork(nn.Module):
         tk_ids = [name2id[name] for name in tk_names]
         # Devide the rest into multiple chunks
         chk_ids = [0] * 4 * self.initial_chunk_size
-        num_reset_chunk = 2
+        num_reset_chunk = 4
         assert (horizon - self.initial_chunk_size) % num_reset_chunk == 0, "The horizon should be divisible by num_reset_chunk"
         for i in range(num_reset_chunk):
             chk_ids += [1 + i] * (4 * ((horizon - self.initial_chunk_size) // num_reset_chunk))
@@ -280,7 +280,7 @@ class ARPNetwork(nn.Module):
             RETURN_VIDEO = True
             if RETURN_VIDEO:
                 random_id = random.randint(0, 100000)
-                video_dir = f"/tmp/arp_video/{random_id}"
+                video_dir = f"./tmp/arp_video/{random_id}"
                 os.makedirs(video_dir, exist_ok=True)
             threads = []
             visualized_images = []
