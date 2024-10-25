@@ -264,7 +264,9 @@ class ARPNetwork(nn.Module):
                 contexts={
                     "visual-tokens": visual_tokens,
                     "visual-featmap@init": visual_featmap.repeat(1, 4 * self.initial_chunk_size, 1, 1, 1).flatten(0, 1),
-                    "visual-featmap@rest": visual_featmap.repeat(1, 4 * (horizon - self.initial_chunk_size), 1, 1, 1).flatten(0, 1),
+                    "visual-featmap@rest": visual_featmap.repeat(1, 4 * (horizon - self.initial_chunk_size) // num_reset_chunk, 1, 1, 1).flatten(
+                        0, 1
+                    ),
                 },
                 sample=True,
             )
