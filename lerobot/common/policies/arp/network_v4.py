@@ -1,14 +1,16 @@
 from collections import defaultdict
 from einops import rearrange
-import math
+import os
 import torch
 import torch.nn as nn
+import threading
 from torch import Tensor
 import torchvision
 from torchvision.ops.misc import FrozenBatchNorm2d
 from torchvision.models._utils import IntermediateLayerGetter
 
 # from torchvision.models import vit_b_16, ViT_B_16_Weights, vit_s_16, ViT_S_16_Weights
+from copy import deepcopy
 from transformers import Dinov2Model
 from collections import deque
 import numpy as np
@@ -18,6 +20,7 @@ from lerobot.common.policies.utils import (
     get_dtype_from_parameters,
     populate_queues,
 )
+from lerobot.common.utils.io_utils import write_video
 from peft import LoraConfig, get_peft_model
 from dataclasses import dataclass, field
 from huggingface_hub import PyTorchModelHubMixin
@@ -196,7 +199,13 @@ class ARPNetwork(nn.Module):
             + ["gripper"] * horizon
         )
         tk_ids = [name2id[name] for name in tk_names]
-        chk_ids = [0] * 4 * self.initial_chunk_size + [1] * 4 * (horizon - self.initial_chunk_size) + [2] * horizon
+        # Devide the rest into multiple chunks
+        chk_ids = [0] * 4 * self.initial_chunk_size
+        num_reset_chunk = 2
+        for i in range(num_reset_chunk):
+            chk_ids += [1 + i] * (4 * ((horizon - self.initial_chunk_size) // num_reset_chunk))
+        chk_ids += [chk_ids[-1] + 1] * (horizon - len(chk_ids) // 4) * 4
+        chk_ids += [chk_ids[-1] + 1] * horizon
 
         if self.training:
             assert horizon == batch["origin"].shape[1]
@@ -264,16 +273,44 @@ class ARPNetwork(nn.Module):
             keypoints = pred_tks[:, ::4, :-1] * self.visual_guide_downsample
 
             images = denormalize_bchw_image(images)
-            visualized_images = []
-            for bi in range(bs):
-                img = to_pil_image(images[bi])
-                img = draw_keypoints(img, keypoints[bi].detach().cpu(), colors=(255, 0, 0))
-                # draw gt keypoints
-                if "origin" in batch:
-                    gt_keypoints = batch["origin"]
-                    img = draw_keypoints(img, gt_keypoints[bi].detach().cpu(), colors=(0, 255, 0))
-                visualized_images.append(img)
 
+            RETURN_VIDEO = True
+            if RETURN_VIDEO:
+                random_id = random.randint(0, 100000)
+                video_dir = f"/tmp/arp_video/{random_id}"
+                os.makedirs(video_dir, exist_ok=True)
+            threads = []
+            visualized_images = []
+            # observe the first 16 images
+            for bi in range(min(bs, 16)):
+                img = to_pil_image(images[bi])
+                if not RETURN_VIDEO:
+                    img = draw_keypoints(img, keypoints[bi].detach().cpu(), colors=(255, 0, 0))
+                    # draw gt keypoints
+                    if "origin" in batch:
+                        gt_keypoints = batch["origin"]
+                        img = draw_keypoints(img, gt_keypoints[bi].detach().cpu(), colors=(0, 255, 0))
+                    visualized_images.append(img)
+                else:
+                    video_imgs = []
+                    for kp, gt_kp in zip(keypoints[bi].detach().cpu(), batch["origin"][bi].detach().cpu()):
+                        _img = deepcopy(img)
+                        _img = draw_keypoints(_img, kp[None], colors=(255, 0, 0))
+                        _img = draw_keypoints(_img, gt_kp[None], colors=(0, 255, 0))
+                        video_imgs.append(_img)
+                    # write video
+                    video_path = f"{video_dir}/{bi}.mp4"
+                    thread = threading.Thread(
+                        target=write_video,
+                        args=(str(video_path), video_imgs, 25),
+                    )
+                    thread.start()
+                    threads.append(thread)
+                    visualized_images.append(video_path)
+
+            if RETURN_VIDEO:
+                for thread in threads:
+                    thread.join()
             return {
                 "action": pred_tks,
                 "visualized_images": visualized_images,
