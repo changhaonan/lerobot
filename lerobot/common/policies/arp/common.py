@@ -169,6 +169,113 @@ def draw_keypoints(
         return torch.from_numpy(np.array(img_to_draw)).permute(2, 0, 1).to(dtype=torch.uint8)
 
 
+@torch.no_grad()
+def draw_kps_horizon(
+    image: torch.Tensor,
+    kpts_horizon: torch.Tensor,
+    connectivity: list[tuple[int, int]] | None = None,
+    colors: list[tuple[int, int, int]] | tuple[int, int, int] = (255, 0, 0),
+    kp_colors: list[tuple[int, int, int]] | tuple[int, int, int] = [(255, 0, 0), (0, 255, 0), (0, 0, 255)],
+    radius: int = 1,
+    width: int = 3,
+    output_pil=True,
+    transparency=1.0,
+    line_under=True,
+):
+    """Draw keypoints with a horizon.
+    Args:
+        kps_horizon: torch.Tensor of shape (1, N, H, 3/2) where B is the batch size, H is the horizon, N is the number of keypoints, and 3 is the x, y, and visibility.
+    """
+
+    def is_valid(*args):
+        return all([a >= 0 for a in args])
+
+    if isinstance(image, Image.Image):
+        image = pil_to_tensor(image)
+
+    if isinstance(image, np.ndarray):
+        image = torch.from_numpy(image)
+        if image.shape[-1] == 3:
+            image = image.permute(2, 0, 1)
+
+    POINT_SIZE = kpts_horizon.shape[-1]
+    NUM_KPS = kpts_horizon.shape[0]
+    HORIZON = kpts_horizon.shape[1]
+    kpts_horizon = kpts_horizon.reshape(HORIZON, NUM_KPS, POINT_SIZE)
+    ndarr = image.permute(1, 2, 0).cpu().numpy()
+    img_to_draw = Image.fromarray(ndarr)
+    if transparency < 1.0:
+        draw = ImageDraw.Draw(img_to_draw, "RGBA")
+    else:
+        draw = ImageDraw.Draw(img_to_draw, None if POINT_SIZE == 2 else "RGBA")
+    kpts_horizon = kpts_horizon.clone()
+    if POINT_SIZE == 3:
+        kpts_horizon[..., -1] *= 255
+    img_kpts_horizon = kpts_horizon.to(torch.int64).tolist()
+
+    for horizon_id, kpts in enumerate(img_kpts_horizon):
+        for kpt_id, kpt_inst in enumerate(kpts):
+            kpt_size = len(kpt_inst)
+            if kpt_size == 2:
+                kpt_inst.append(255)
+            if not is_valid(*kpt_inst):
+                continue
+            # draw kpts
+            x1 = kpt_inst[0] - radius
+            x2 = kpt_inst[0] + radius
+            y1 = kpt_inst[1] - radius
+            y2 = kpt_inst[1] + radius
+            # if len(kpt_inst) == 3:
+            #     kp_color = colors + (int(kpt_inst[2]),)
+            # elif transparency < 1.0:
+            #     kp_color = colors + (int(255 * (1 - transparency)),)
+            # else:
+            #     kp_color = colors
+            kp_color = kp_colors[kpt_id % len(kp_colors)]
+            draw.ellipse([x1, y1, x2, y2], fill=kp_color, outline=None, width=0)
+            # draw lines within one frame
+            if connectivity is not None:
+                for connection in connectivity:
+                    start_pt_x = kpt_inst[connection[0]][0]
+                    start_pt_y = kpt_inst[connection[0]][1]
+
+                    end_pt_x = kpt_inst[connection[1]][0]
+                    end_pt_y = kpt_inst[connection[1]][1]
+
+                    if not is_valid(start_pt_x, start_pt_y, end_pt_x, end_pt_y):
+                        continue
+
+                    if transparency < 1.0:
+                        kp_line_color = colors + (int(255 * (1 - transparency)),)
+                    else:
+                        kp_line_color = colors
+
+                    draw.line(((start_pt_x, start_pt_y), (end_pt_x, end_pt_y)), width=width, fill=kp_line_color)
+    # # draw lines across frames, connecting the same keypoint across different frames
+    # for keypoint_id in range(NUM_KPS):
+    #     for horizon_id in range(HORIZON - 1):
+    #         start_pt_x = img_kpts_horizon[horizon_id][keypoint_id][0]
+    #         start_pt_y = img_kpts_horizon[horizon_id][keypoint_id][1]
+
+    #         end_pt_x = img_kpts_horizon[horizon_id + 1][keypoint_id][0]
+    #         end_pt_y = img_kpts_horizon[horizon_id + 1][keypoint_id][1]
+
+    #         if not is_valid(start_pt_x, start_pt_y, end_pt_x, end_pt_y):
+    #             continue
+
+    #         if transparency < 1.0:
+    #             kp_line_color = colors + (int(255 * (1 - transparency)),)
+    #         else:
+    #             kp_line_color = colors
+
+    #         draw.line(((start_pt_x, start_pt_y), (end_pt_x, end_pt_y)), width=width, fill=kp_line_color)
+
+    if output_pil:
+        return img_to_draw
+    else:
+        return torch.from_numpy(np.array(img_to_draw)).permute(2, 0, 1).to(dtype=torch.uint8)
+
+
 def generate_heatmap_from_screen_pts(pt, res, sigma=1.5, thres_sigma_times=3):  # 2d label smoothing
     """
     Pytorch code to generate heatmaps from point. Points with values less than
