@@ -179,7 +179,6 @@ def draw_kps_horizon(
     radius: int = 1,
     width: int = 3,
     output_pil=True,
-    transparency=1.0,
     line_under=True,
 ):
     """Draw keypoints with a horizon.
@@ -204,16 +203,14 @@ def draw_kps_horizon(
     kpts_horizon = kpts_horizon.reshape(HORIZON, NUM_KPS, POINT_SIZE)
     ndarr = image.permute(1, 2, 0).cpu().numpy()
     img_to_draw = Image.fromarray(ndarr)
-    if transparency < 1.0:
-        draw = ImageDraw.Draw(img_to_draw, "RGBA")
-    else:
-        draw = ImageDraw.Draw(img_to_draw, None if POINT_SIZE == 2 else "RGBA")
+    draw = ImageDraw.Draw(img_to_draw, "RGBA")
     kpts_horizon = kpts_horizon.clone()
     if POINT_SIZE == 3:
         kpts_horizon[..., -1] *= 255
     img_kpts_horizon = kpts_horizon.to(torch.int64).tolist()
 
     for horizon_id, kpts in enumerate(img_kpts_horizon):
+        transparency = (horizon_id / HORIZON) * 0.5
         for kpt_id, kpt_inst in enumerate(kpts):
             kpt_size = len(kpt_inst)
             if kpt_size == 2:
@@ -225,13 +222,7 @@ def draw_kps_horizon(
             x2 = kpt_inst[0] + radius
             y1 = kpt_inst[1] - radius
             y2 = kpt_inst[1] + radius
-            # if len(kpt_inst) == 3:
-            #     kp_color = colors + (int(kpt_inst[2]),)
-            # elif transparency < 1.0:
-            #     kp_color = colors + (int(255 * (1 - transparency)),)
-            # else:
-            #     kp_color = colors
-            kp_color = kp_colors[kpt_id % len(kp_colors)]
+            kp_color = kp_colors[kpt_id % len(kp_colors)] + (int(255 * (1 - transparency)),)
             draw.ellipse([x1, y1, x2, y2], fill=kp_color, outline=None, width=0)
             # draw lines within one frame
             if connectivity is not None:
@@ -245,11 +236,7 @@ def draw_kps_horizon(
                     if not is_valid(start_pt_x, start_pt_y, end_pt_x, end_pt_y):
                         continue
 
-                    if transparency < 1.0:
-                        kp_line_color = colors + (int(255 * (1 - transparency)),)
-                    else:
-                        kp_line_color = colors
-
+                    kp_line_color = colors + (int(255 * (1 - transparency)),)
                     draw.line(((start_pt_x, start_pt_y), (end_pt_x, end_pt_y)), width=width, fill=kp_line_color)
     # # draw lines across frames, connecting the same keypoint across different frames
     # for keypoint_id in range(NUM_KPS):
