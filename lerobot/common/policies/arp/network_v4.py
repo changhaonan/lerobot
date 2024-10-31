@@ -277,7 +277,7 @@ class ARPNetwork(nn.Module):
 
             images = denormalize_bchw_image(images)
 
-            RETURN_VIDEO = True
+            RETURN_VIDEO = False
             if RETURN_VIDEO:
                 random_id = random.randint(0, 100000)
                 video_dir = f"./tmp/arp_video/{random_id}"
