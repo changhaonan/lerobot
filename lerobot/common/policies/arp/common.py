@@ -10,18 +10,38 @@ import numpy as np
 from torchvision.utils import Optional, Tuple, Union, ImageDraw, List, Image
 
 
-def augmentation_recipe(target_size=None, color=0.25, spatial=0.25, hflip=0.5, vflip=0.1, mask=0, keypoints=False, normalize=True, to_tensor=False):
-    T_flip = A.Compose([A.HorizontalFlip(p=hflip), A.VerticalFlip(p=vflip)])
+def augmentation_recipe(
+    target_size=None,
+    color=0.25,
+    spatial=0.25,
+    hflip=0.5,
+    vflip=0.1,
+    mask=0,
+    keypoints=False,
+    normalize=True,
+    to_tensor=False,
+    additional_targets=None,
+):
+    T_flip = A.Compose([A.HorizontalFlip(p=hflip), A.VerticalFlip(p=vflip)], additional_targets=additional_targets)
 
     T_mask = A.XYMasking(
-        num_masks_x=10, num_masks_y=10, mask_x_length=6, mask_y_length=6, fill_value=0, mask_fill_value=0, always_apply=False, p=mask
+        num_masks_x=10,
+        num_masks_y=10,
+        mask_x_length=6,
+        mask_y_length=6,
+        fill_value=0,
+        mask_fill_value=0,
+        always_apply=False,
+        p=mask,
     )
 
     T_spatial = A.OneOf(
         [
-            A.Affine(rotate=(-45, 45), translate_percent=(0.1, 0.3), scale=(0.5, 0.95)),
-            A.Perspective(scale=(0.2, 0.4)),
-            A.Rotate(limit=60),
+            # A.Affine(rotate=(-45, 45), translate_percent=(0.1, 0.3), scale=(0.5, 0.95)),
+            # A.Perspective(scale=(0.2, 0.4)),
+            # A.Perspective(scale=1.0),
+            A.SafeRotate(limit=60, border_mode=cv2.BORDER_CONSTANT),
+            # A.Rotate(limit=60),  #FIXME: this will cause the change of keypoints.
         ],
         p=1.0,
     )
@@ -72,9 +92,9 @@ def augmentation_recipe(target_size=None, color=0.25, spatial=0.25, hflip=0.5, v
         ] + Ts
 
     if keypoints:
-        return A.Compose(Ts, keypoint_params=A.KeypointParams(format="xy", remove_invisible=False))
+        return A.Compose(Ts, keypoint_params=A.KeypointParams(format="xy", remove_invisible=False), additional_targets=additional_targets)
     else:
-        return A.Compose(Ts)
+        return A.Compose(Ts, additional_targets=additional_targets)
 
 
 @torch.no_grad()

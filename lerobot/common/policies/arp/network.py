@@ -1,12 +1,17 @@
-from lerobot.common.policies.arp import arp
+from collections import defaultdict
 from einops import rearrange
-import math
+import os
 import torch
 import torch.nn as nn
+import threading
 from torch import Tensor
 import torchvision
 from torchvision.ops.misc import FrozenBatchNorm2d
 from torchvision.models._utils import IntermediateLayerGetter
+
+# from torchvision.models import vit_b_16, ViT_B_16_Weights, vit_s_16, ViT_S_16_Weights
+from copy import deepcopy
+from transformers import Dinov2Model
 from collections import deque
 import numpy as np
 from lerobot.common.policies.normalize import Normalize, Unnormalize
@@ -15,85 +20,39 @@ from lerobot.common.policies.utils import (
     get_dtype_from_parameters,
     populate_queues,
 )
+from lerobot.common.utils.io_utils import write_video
+from peft import LoraConfig, get_peft_model
 from dataclasses import dataclass, field
 from huggingface_hub import PyTorchModelHubMixin
 from omegaconf import DictConfig, OmegaConf
+from torchvision.transforms.functional import to_pil_image
 
-
-def generate_heatmap_from_screen_pts(pt, res, sigma=1.5, thres_sigma_times=3):  # 2d label smoothing
-    """
-    Pytorch code to generate heatmaps from point. Points with values less than
-    thres are made 0
-    :type pt: torch.FloatTensor of size (num_pt, 2)
-    :type res: int or (int, int)
-    :param sigma: the std of the gaussian distribition. if it is -1, we
-        generate a hm with one hot vector
-    :type sigma: float
-    :type thres: float
-    """
-    num_pt, x = pt.shape
-    assert x == 2
-    assert sigma > 0
-
-    if isinstance(res, int):
-        resx = resy = res
-    else:
-        resx, resy = res
-
-    _hmx = torch.arange(0, resy).to(pt.device)
-    _hmx = _hmx.view([1, resy]).repeat(resx, 1).view([resx, resy, 1])
-    _hmy = torch.arange(0, resx).to(pt.device)
-    _hmy = _hmy.view([resx, 1]).repeat(1, resy).view([resx, resy, 1])
-    hm = torch.cat([_hmx, _hmy], dim=-1)
-    hm = hm.view([1, resx, resy, 2]).repeat(num_pt, 1, 1, 1)  # one HxW heatmap for each point?
-
-    pt = pt.view([num_pt, 1, 1, 2])
-    hm = torch.exp(-1 * torch.sum((hm - pt) ** 2, -1) / (2 * (sigma**2)))  # RBF Kernel
-    thres = np.exp(-1 * (thres_sigma_times**2) / 2)  # truncated
-    hm[hm < thres] = 0.0
-
-    hm /= torch.sum(hm, (1, 2), keepdim=True) + 1e-6  # normalization
-    return hm  # (n_pt, h, w)
-
-
-class SinusoidalPositionEmbedding2d(nn.Module):
-    """2D sinusoidal positional embeddings similar to what's presented in Attention Is All You Need.
-
-    The variation is that the position indices are normalized in [0, 2π] (not quite: the lower bound is 1/H
-    for the vertical direction, and 1/W for the horizontal direction.
-    """
-
-    def __init__(self, dimension: int):
-        """
-        Args:
-            dimension: The desired dimension of the embeddings.
-        """
-        super().__init__()
-        self.dimension = dimension
-        self._two_pi = 2 * math.pi
-        self._eps = 1e-6
-        # Inverse "common ratio" for the geometric progression in sinusoid frequencies.
-        self._temperature = 10000
-
-    def forward(self, x):
-        """
-        Args:
-            x: A (B, C, H, W) batch of 2D feature map to generate the embeddings for.
-        Returns:
-            A (1, C, H, W) batch of corresponding sinusoidal positional embeddings.
-        """
-        not_mask = torch.ones_like(x[0, :1])  # (1, H, W)
-        y_range = not_mask.cumsum(1, dtype=torch.float32)
-        x_range = not_mask.cumsum(2, dtype=torch.float32)
-        y_range = y_range / (y_range[:, -1:, :] + self._eps) * self._two_pi
-        x_range = x_range / (x_range[:, :, -1:] + self._eps) * self._two_pi
-        inverse_frequency = self._temperature ** (2 * (torch.arange(self.dimension, dtype=torch.float32, device=x.device) // 2) / self.dimension)
-        x_range = x_range.unsqueeze(-1) / inverse_frequency  # (1, H, W, 1)
-        y_range = y_range.unsqueeze(-1) / inverse_frequency  # (1, H, W, 1)
-        pos_embed_x = torch.stack((x_range[..., 0::2].sin(), x_range[..., 1::2].cos()), dim=-1).flatten(3)
-        pos_embed_y = torch.stack((y_range[..., 0::2].sin(), y_range[..., 1::2].cos()), dim=-1).flatten(3)
-        pos_embed = torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)  # (1, C, H, W)
-        return pos_embed
+try:
+    from common import (
+        draw_keypoints,
+        denormalize_bchw_image,
+        generate_heatmap_from_screen_pts,
+        SinusoidalPositionEmbedding2d,
+        pose7_to_frame,
+        Rotation,
+        augmentation_recipe,
+        normalize_bchw_image,
+    )
+    import arp
+except ImportError:
+    from lerobot.common.policies.arp.common import (
+        draw_keypoints,
+        denormalize_bchw_image,
+        generate_heatmap_from_screen_pts,
+        SinusoidalPositionEmbedding2d,
+        pose7_to_frame,
+        Rotation,
+        augmentation_recipe,
+        normalize_bchw_image,
+    )
+    from lerobot.common.policies.arp import arp
+import cv2
+import random
 
 
 class ARPNetwork(nn.Module):
@@ -106,21 +65,29 @@ class ARPNetwork(nn.Module):
         n_heads=8,
         n_encoder_layers=4,
         n_arp_layers=4,
-        num_gmm_latents=4,
-        action_from_glb_only=True,
-        visual_guide_downsample=4,
+        visual_guide_downsample=2,
         horizon=15,
-        num_guide_points=15,
+        reverse_plan=True,
+        initial_chunk_size=1,
+        backbones="vit",
+        **kwargs,
     ):
         super().__init__()
-        self.name = "arp"
-        backbone_model = getattr(torchvision.models, "resnet18")(
-            replace_stride_with_dilation=[False, False, False],
-            weights="ResNet18_Weights.IMAGENET1K_V1",
-            norm_layer=FrozenBatchNorm2d,
-        )
-        self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
-
+        if backbones == "resnet18":
+            backbone_model = getattr(torchvision.models, "resnet18")(
+                replace_stride_with_dilation=[False, False, False],
+                weights="ResNet18_Weights.IMAGENET1K_V1",
+                norm_layer=FrozenBatchNorm2d,
+            )
+            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            self.visual_input_proj = nn.Conv2d(backbone_model.fc.in_features, dim_model, kernel_size=1)
+        elif backbones == "vit":
+            lora_config = LoraConfig(target_modules=["fc1", "fc2", "query", "value", "key", "dense", "projection"])
+            dinov2 = Dinov2Model.from_pretrained(f"facebook/dinov2-small")
+            self.backbone = get_peft_model(dinov2, lora_config)
+            self.visual_input_proj = nn.Linear(self.backbone.config.hidden_size, dim_model)
+        else:
+            raise ValueError(f"Backbone {backbones} is not supported.")
         self.encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=dim_model,
@@ -134,13 +101,11 @@ class ARPNetwork(nn.Module):
             num_layers=n_encoder_layers,
             norm=nn.LayerNorm(dim_model),
         )
-
-        self.robot_state_input_proj = nn.Linear(8, dim_model)
-        self.visual_input_proj = nn.Conv2d(backbone_model.fc.in_features, dim_model, kernel_size=1)
-        self.robot_state_pos_embed = nn.Embedding(1, dim_model)
         self.visual_pos_embed = SinusoidalPositionEmbedding2d(dim_model // 2)
+        self.cls_embed = nn.Embedding(1, dim_model)
+        self.cls_pos_embed = nn.Embedding(1, dim_model)
 
-        stride = 32
+        stride = 32 if backbones == "resnet18" else 14  # vit: change to 14
         self.policy = arp.AutoRegressivePolicy(
             arp.ModelConfig(
                 n_embd=dim_model,
@@ -150,6 +115,7 @@ class ARPNetwork(nn.Module):
                         n_head=n_heads,
                         mlp_ratio=mlp_ratio,
                         AdaLN=True,
+                        norm_before_AdaLN=True,
                         mlp_dropout=dropout,
                         attn_kwargs={"attn_pdrop": dropout, "resid_pdrop": dropout},
                         cond_attn_kwargs={"attn_pdrop": dropout, "resid_pdrop": dropout},
@@ -158,128 +124,203 @@ class ARPNetwork(nn.Module):
                 ]
                 * n_arp_layers,
                 tokens=[
-                    arp.TokenType.make(name="state", is_control=True, is_continuous=True, dim=8, embedding="linear"),
                     arp.TokenType.make(
-                        name="prompt-features", dim=1, embedding="discrete", is_control=True, embedding_kwargs={"embed_from": "prompt-features"}
-                    ),
-                    arp.TokenType.make(
-                        name="visual-guide",
+                        name="init",
                         is_continuous=True,
                         dim=2,
                         embedding="position_2d",
                         predictor="upsample_from_2d_attn",
                         predictor_kwargs={
-                            "attn_with": "visual-featmap",
+                            "attn_with": f"visual-featmap@init",
                             "upscale_ratio": stride // visual_guide_downsample,
-                            "label_name": "smooth-heatmap",
+                            "label_name": f"smooth-heatmap@init",
                         },
                     ),
                     arp.TokenType.make(
-                        name="action",
+                        name="rest",
                         is_continuous=True,
-                        dim=8,
-                        embedding="linear",
-                        predictor="gmm",
-                        predictor_kwargs={"num_latents": num_gmm_latents},
+                        dim=2,
+                        embedding="position_2d",
+                        predictor="upsample_from_2d_attn",
+                        predictor_kwargs={
+                            "attn_with": f"visual-featmap@rest",
+                            "upscale_ratio": stride // visual_guide_downsample,
+                            "label_name": f"smooth-heatmap@rest",
+                        },
                     ),
+                    arp.TokenType.make(name="gripper", is_continuous=False, dim=1, dict_sizes=[2], embedding="discrete", predictor="class"),
                 ],
             )
         )
         self.visual_guide_downsample = visual_guide_downsample
-        self.action_from_glb_only = action_from_glb_only
+        self.reverse_plan = reverse_plan
         self.horizon = horizon
-        self.num_guide_points = num_guide_points
+        self.initial_chunk_size = initial_chunk_size
 
     def forward(self, batch):
         """
-        observation.images: (bs, num_obs: 1, num_cam: 1, 3, 512, 512)
-        observation.state: (bs, 1, 8)
-        action: (bs, L, 8)
+        observation.images.front: (bs, 1, 3, H, W)
         action_is_pad: (bs, L)
-        visual_guide: (bs, l, 2) only needed during training, l <= L
-        """
-        num_guide_points = self.num_guide_points
-        horizon = self.horizon
-        dev = batch["observation.images"].device
 
-        images = batch["observation.images"][:, 0, 0]  # [bs, 3, 512, 512]
+        # label
+        origin, xaxis, yaxis, zaxis: (bs, L, 2),
+        gripper_open: (bs, L)
+        """
+        horizon = self.horizon
+        # Convert original batch to action in image.
+        dev = batch["observation.images.front"].device
+
+        images = batch["observation.images.front"][:, 0]  # [bs, 3, H, W]
         H, W = images.shape[-2:]
-        visual_features = self.backbone(images)["feature_map"]
-        bs, _, fh, fw = visual_features.shape
-        visual_pos_embed = self.visual_pos_embed(visual_features).to(dtype=visual_features.dtype)
+        bs = images.shape[0]
+        fw, fh = W // 14, H // 14
+        visual_features = self.backbone(images).last_hidden_state
+        visual_feature_map = visual_features[:, 1:, :].permute(0, 2, 1).reshape(bs, -1, fh, fw)
+        # bs, _, fh, fw = visual_features.shape
+        visual_pos_embed = self.visual_pos_embed(visual_feature_map).to(dtype=visual_features.dtype)
         visual_features = self.visual_input_proj(visual_features)
 
-        robot_state_embed = self.robot_state_input_proj(batch["observation.state"][:, 0])
-        encoder_in = torch.cat([robot_state_embed[None, ...], rearrange(visual_features, "b c h w -> (h w) b c")])
-        pos_embed = torch.cat([self.robot_state_pos_embed.weight.unsqueeze(1), visual_pos_embed.flatten(2).permute(2, 0, 1)])
+        encoder_in = torch.cat([self.cls_embed.weight.unsqueeze(1).repeat(1, bs, 1), rearrange(visual_feature_map, "b c h w -> (h w) b c")])
+        pos_embed = torch.cat([self.cls_pos_embed.weight.unsqueeze(1), visual_pos_embed.flatten(2).permute(2, 0, 1)])
 
         encoder_out = self.encoder(encoder_in + pos_embed)
         encoder_out = encoder_out.permute(1, 0, 2)  # (B, fh*fw, C)
-        visual_featmap = encoder_out[:, 1:, :].permute(0, 2, 1).reshape(bs, 1, -1, fh, fw).repeat(1, num_guide_points, 1, 1, 1).flatten(0, 1)
-        visual_tokens = encoder_out[:, 1:, :]
-        global_feat = encoder_out[:, :1, :]
+        visual_featmap = encoder_out[:, 1:, :].permute(0, 2, 1).reshape(bs, 1, -1, fh, fw)
+        visual_tokens = encoder_out
 
         name2id = self.policy.token_name_2_ids
-        tk_names = ["visual-guide"] * num_guide_points + ["prompt-features"] + ["action"] * horizon
+        tk_names = (
+            [
+                "init",
+            ]
+            * 4
+            * self.initial_chunk_size
+            + ["rest"] * 4 * (horizon - self.initial_chunk_size)
+            + ["gripper"] * horizon
+        )
         tk_ids = [name2id[name] for name in tk_names]
-        chk_ids = [0] * num_guide_points + [1] + [2] * horizon
+        # Devide the rest into multiple chunks
+        chk_ids = [0] * 4 * self.initial_chunk_size
+        num_reset_chunk = 4
+        assert (horizon - self.initial_chunk_size) % num_reset_chunk == 0, "The horizon should be divisible by num_reset_chunk"
+        for i in range(num_reset_chunk):
+            chk_ids += [1 + i] * (4 * ((horizon - self.initial_chunk_size) // num_reset_chunk))
+        chk_ids += [chk_ids[-1] + 1] * (horizon - len(chk_ids) // 4) * 4
+        chk_ids += [chk_ids[-1] + 1] * horizon
 
         if self.training:
-            tk_is_pad_mask = torch.cat([torch.full([bs, 1 + num_guide_points], fill_value=False, device=dev), batch["action_is_pad"]], dim=1)
+            assert horizon == batch["origin"].shape[1]
+            if self.reverse_plan:
+                for k in ["origin", "xaxis", "yaxis", "zaxis"]:
+                    batch[k] = torch.flip(batch[k], [1])
+
             vH, vW = H // self.visual_guide_downsample, W // self.visual_guide_downsample
-            visual_guide = batch["visual_guide"].float() / self.visual_guide_downsample
-            heatmap = generate_heatmap_from_screen_pts(visual_guide.flatten(0, 1), (vH, vW)).reshape(bs, num_guide_points, vH, vW)
+
+            actions = defaultdict(list)
+            contexts = defaultdict(list)
+            for k in ["origin", "xaxis", "yaxis", "zaxis"]:
+                visual_action = batch[k].float() / self.visual_guide_downsample
+                actions["init"].append(visual_action[:, : self.initial_chunk_size])
+                actions["rest"].append(visual_action[:, self.initial_chunk_size :])
+
+                heatmap = generate_heatmap_from_screen_pts(visual_action.flatten(0, 1), (vH, vW)).reshape(bs, horizon, 1, vH, vW)
+                contexts[f"smooth-heatmap@init"].append(heatmap[:, : self.initial_chunk_size])
+                contexts[f"smooth-heatmap@rest"].append(heatmap[:, self.initial_chunk_size :])
+
+            for k in ["init", "rest"]:
+                actions[k] = torch.cat([a[:, :, None, :] for a in actions[k]], dim=2)  # bs, L, 4, 2
+                hm = torch.cat(contexts[f"smooth-heatmap@{k}"], dim=2).flatten(1, 2)
+                contexts[f"smooth-heatmap@{k}"] = hm.flatten(0, 1)
+                contexts[f"visual-featmap@{k}"] = visual_featmap.repeat(1, hm.shape[1], 1, 1, 1).flatten(0, 1)
+
+            actions["gripper"] = batch["gripper_open"].unsqueeze(-1).repeat(1, 1, 2).float()
+            contexts["visual-tokens"] = visual_tokens
+
+            tk_vals = torch.cat([torch.cat([actions["init"], actions["rest"]], dim=1).flatten(1, 2), actions["gripper"]], dim=1)
             chk_ids = torch.as_tensor(chk_ids, device=dev)[None, :]
-            tk_vals = arp.cat_uneven_blc_tensors(visual_guide, torch.zeros(bs, 1, 1, device=dev), batch["action"])
             tk_ids = torch.as_tensor(tk_ids).to(dev)[None, :, None].repeat(bs, 1, 1)
             tks = torch.cat([tk_vals, tk_ids], dim=-1)
-            if self.action_from_glb_only:
-                loss_dict1 = self.policy.compute_loss(
-                    tks[:, :num_guide_points],
-                    chk_ids[:, :num_guide_points],
-                    contexts={"visual-tokens": visual_tokens, "visual-featmap": visual_featmap, "smooth-heatmap": heatmap.flatten(0, 1)},
-                )
-                loss_dict2 = self.policy.compute_loss(
-                    tks,
-                    chk_ids,
-                    contexts={"visual-tokens": None, "prompt-features": global_feat},
-                    skip_tokens=[name2id["visual-guide"]],
-                    valid_tk_mask=~tk_is_pad_mask,
-                )
-                loss_dict = {**loss_dict1, **loss_dict2}
-            else:
-                loss_dict = self.policy.compute_loss(
-                    tks,
-                    chk_ids,
-                    contexts={
-                        "visual-tokens": visual_tokens,
-                        "visual-featmap": visual_featmap,
-                        "prompt-features": global_feat,
-                        "smooth-heatmap": heatmap.flatten(0, 1),
-                    },
-                    valid_tk_mask=~tk_is_pad_mask,
-                )
-            # "loss" is the sum of all losses
-            loss_dict["loss"] = sum(loss_dict.values())
+            loss_dict = self.policy.compute_loss(tks, chk_ids, contexts=contexts)
+
+            DEBUG = False
+            if DEBUG:
+                images = denormalize_bchw_image(images)
+                visualized_images = []
+                for bi in range(bs):
+                    img = to_pil_image(images[bi])
+                    img = draw_keypoints(
+                        img, torch.cat([actions["init"][bi, :, 0], actions["rest"][bi, :, 0]]).detach().cpu() * self.visual_guide_downsample
+                    )
+                    visualized_images.append(img)
+                loss_dict["visualized_images"] = visualized_images
+            # Compute a sum loss
+            loss_dict["loss"] = sum([v for k, v in loss_dict.items() if "loss" in k])
             return loss_dict
         else:
-            prompt_tks = torch.zeros(bs, 0, 2, device=dev)
+            prompt_tks = torch.zeros(bs, 0, 3, device=dev)
             future_tk_chk_ids = [{"tk_id": tk_id, "chk_id": chk_id} for tk_id, chk_id in zip(tk_ids, chk_ids)]
-            future_tk_chk_ids[num_guide_points]["tk_val"] = 0  # prompt features
-
-            if self.action_from_glb_only:
-                visual_tokens = {frozenset(chk_ids[: num_guide_points + 1]): visual_tokens, frozenset(chk_ids[num_guide_points + 1 :]): None}
-
             pred_tks = self.policy.generate(
                 prompt_tks,
                 future_tk_chk_ids,
-                contexts={"visual-tokens": visual_tokens, "visual-featmap": visual_featmap, "prompt-features": global_feat},
+                contexts={
+                    "visual-tokens": visual_tokens,
+                    "visual-featmap@init": visual_featmap.repeat(1, 4 * self.initial_chunk_size, 1, 1, 1).flatten(0, 1),
+                    "visual-featmap@rest": visual_featmap.repeat(1, 4 * (horizon - self.initial_chunk_size) // num_reset_chunk, 1, 1, 1).flatten(
+                        0, 1
+                    ),
+                },
                 sample=True,
             )
-            visual_guide = pred_tks[:, :num_guide_points, :2] * self.visual_guide_downsample
-            return {"visual_guide": visual_guide, "action": pred_tks[:, num_guide_points + 1 :, :-1]}
+            # at this moment, the pred tks are visual actions only
+            pred_tks = pred_tks[:, : self.horizon * 4]
+            keypoints = pred_tks[:, ::4, :-1] * self.visual_guide_downsample
+
+            images = denormalize_bchw_image(images)
+
+            RETURN_VIDEO = False
+            if RETURN_VIDEO:
+                random_id = random.randint(0, 100000)
+                video_dir = f"./tmp/arp_video/{random_id}"
+                os.makedirs(video_dir, exist_ok=True)
+            threads = []
+            visualized_images = []
+            # observe the first 16 images
+            for bi in range(min(bs, 16)):
+                img = to_pil_image(images[bi])
+                if not RETURN_VIDEO:
+                    img = draw_keypoints(img, keypoints[bi].detach().cpu(), colors=(255, 0, 0))
+                    # draw gt keypoints
+                    if "origin" in batch:
+                        gt_keypoints = batch["origin"]
+                        img = draw_keypoints(img, gt_keypoints[bi].detach().cpu(), colors=(0, 255, 0))
+                    visualized_images.append(img)
+                else:
+                    video_imgs = []
+                    for kp, gt_kp in zip(keypoints[bi].detach().cpu(), batch["origin"][bi].detach().cpu()):
+                        _img = deepcopy(img)
+                        _img = draw_keypoints(_img, kp[None], colors=(255, 0, 0))
+                        _img = draw_keypoints(_img, gt_kp[None], colors=(0, 255, 0))
+                        video_imgs.append(_img)
+                    # write video
+                    video_path = f"{video_dir}/{bi}.mp4"
+                    thread = threading.Thread(
+                        target=write_video,
+                        args=(str(video_path), video_imgs, 25),
+                    )
+                    thread.start()
+                    threads.append(thread)
+                    visualized_images.append(video_path)
+
+            if RETURN_VIDEO:
+                for thread in threads:
+                    thread.join()
+            return {
+                "action": pred_tks,
+                "visualized_images": visualized_images,
+            }
 
 
+######################################## For lerobot ########################################
 @dataclass
 class ARPConfig:
     n_obs_steps: int = 1
@@ -379,8 +420,6 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
 
     def forward(self, batch: dict[str, Tensor]) -> dict:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.training:
-            batch = self._preprocess(batch)
         batch = self.normalize_inputs(batch)
         if len(self.expected_image_keys) > 0:
             batch = dict(batch)
@@ -391,8 +430,6 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
-        if self.training:
-            batch = self._preprocess(batch)
         batch = self.normalize_inputs(batch)
         if len(self.expected_image_keys) > 0:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -415,25 +452,112 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
         action = self._queues["action"].popleft()
         return action
 
-    def _preprocess(self, batch):
-        bs = batch["action"].shape[0]
-        proj = batch["observation.camera_proj.front"].reshape(bs, 3, 4)
-        action_points = batch["action"][:, :, :3]
-        action_points = torch.cat([action_points, torch.ones((bs, action_points.shape[1], 1), device=action_points.device)], dim=-1)
-        proj_p = torch.matmul(proj, action_points.permute(0, 2, 1)).permute(0, 2, 1)
-        proj_p = proj_p[:, :, :2] / (proj_p[:, :, 2:] + 1e-6)
-        batch["visual_guide"] = proj_p[:, : self.model.num_guide_points, :]
-        # [DEBUG]
-        # import cv2
 
-        # for i in range(bs):
-        #     img = batch["observation.images.front"][i, 0].cpu().numpy().transpose(1, 2, 0)
-        #     img = (img * 255).astype(np.uint8)
-        #     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        #     for j in range(self.model.num_guide_points):
-        #         cv2.circle(img, tuple(proj_p[i, j].int().tolist()), 5, (0, 255, 0), -1)
-        #     cv2.imwrite(f"debug_{i}.png", img)
-        return batch
+#################################### Wrap augmentation into a function ####################################
+# count = 0
+
+
+def ImageActionAug(data, aug_prob=0.5, target_size=None):
+    """Project action to image-points."""
+    horizon = len(data["action"])
+    intrinsics = data["observation.camera_int.front"].reshape(3, 3).numpy().astype(np.float64)
+    extrinsics = data["observation.camera_ext.front"].reshape(4, 4).numpy().astype(np.float64)
+    extrinsics = np.linalg.inv(extrinsics)
+    extrinsics[0] = -extrinsics[0]
+    n_obs = data["observation.images.front"].shape[0]
+    additional_targets = {f"image{i}": "image" for i in range(1, n_obs)}
+    # aug_transform = augmentation_recipe(
+    #     target_size=target_size,
+    #     spatial=aug_prob if aug_prob > 0 else 0.0,
+    #     color=0.0,
+    #     mask=aug_prob if aug_prob > 0 else 0.0,
+    #     hflip=0,
+    #     vflip=0,
+    #     normalize=True,
+    #     keypoints=True,
+    #     to_tensor=True,
+    #     additional_targets=additional_targets,
+    # )
+    aug_transform = augmentation_recipe(
+        target_size=target_size,
+        spatial=0.0,
+        color=0.0,
+        mask=0.0,
+        hflip=0,
+        vflip=0,
+        normalize=True,
+        keypoints=True,
+        to_tensor=True,
+        additional_targets=additional_targets,
+    )
+
+    # kpts in actions.
+    action_rots = Rotation.from_euler("XYZ", data["action"][:, 3:6], degrees=False)
+    action_pose7d = np.concatenate([data["action"][:, :3], action_rots.as_quat()], axis=1)
+    action_kpts = pose7_to_frame(action_pose7d)
+    action_kpts = cv2.projectPoints(action_kpts.reshape(-1, 3), extrinsics[:3, :3], extrinsics[:3, 3], intrinsics, None)[0].reshape(horizon, 4, 2)
+    num_action_kpts = action_kpts.shape[0]
+    # kpts in states.
+    state_rots = Rotation.from_euler("XYZ", data["observation.state"][:, 3:6], degrees=False)
+    state_pose7d = np.concatenate([data["observation.state"][:, :3], state_rots.as_quat()], axis=1)
+    state_kpts = pose7_to_frame(state_pose7d)
+    state_kpts = cv2.projectPoints(state_kpts.reshape(-1, 3), extrinsics[:3, :3], extrinsics[:3, 3], intrinsics, None)[0].reshape(-1, 4, 2)
+    num_state_kpts = state_kpts.shape[0]
+    # merge kpts
+    whole_kpts = np.concatenate([state_kpts.reshape(-1, 2), action_kpts.reshape(-1, 2)], axis=0)
+    # THIS IMAGE is ranged in [0...1], or [0...255]
+    if n_obs == 1:
+        image = (data["observation.images.front"][0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        _ = aug_transform(image=image, keypoints=whole_kpts.reshape(-1, 2))
+        aug_image = _["image"]
+        aug_images = aug_image[None, ...]
+    else:
+        # assemble additional images
+        image = (data["observation.images.front"][0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        additional_images = {
+            f"image{i}": (data[f"observation.images.front"][i].permute(1, 2, 0).numpy() * 255).astype(np.uint8) for i in range(1, n_obs)
+        }
+        _ = aug_transform(image=image, keypoints=whole_kpts.reshape(-1, 2), **additional_images)
+        aug_images = [_["image"]] + [_[f"image{i}"] for i in range(1, n_obs)]
+        aug_images = torch.stack(aug_images, dim=0)
+    # FIXME: there is bug here.
+    # print(f"aug kpts shape: {len(_['keypoints'])}, whole kpts shape: {len(whole_kpts)}")
+    # if len(_["keypoints"]) == (9 * horizon * 4):
+    #     _["keypoints"] = _["keypoints"][4 * (horizon * 4) : 5 * (horizon * 4)]
+    #     # global count
+    #     # count += 1
+    #     draw_keypoints(to_pil_image(denormalize_bchw_image(_["image"])[0]), _["keypoints"]).save(f"bad.{count}.png")
+
+    width, height = target_size
+    aug_whole_kpts = _["keypoints"].reshape(-1, 4, 2)
+    # clip by image size
+    aug_whole_kpts[..., 0] = np.clip(aug_whole_kpts[..., 0], 0, width - 1)
+    aug_whole_kpts[..., 1] = np.clip(aug_whole_kpts[..., 1], 0, height - 1)
+    # normalize to [-1, 1]
+    aug_whole_kpts[..., 0] = aug_whole_kpts[..., 0] / (width - 1) * 2 - 1  # [-1, 1]
+    aug_whole_kpts[..., 1] = aug_whole_kpts[..., 1] / (height - 1) * 2 - 1  # [-1, 1]
+    aug_whole_kpts = torch.from_numpy(aug_whole_kpts)
+    # Split augmented keypoints
+    aug_state_kpts = aug_whole_kpts[:num_state_kpts, ...].reshape(-1, 4, 2)
+    aug_action_kpts = aug_whole_kpts[num_state_kpts:, ...].reshape(-1, 4, 2)
+    # [DEBUG]
+    # print(f"state_kpts: {state_kpts.shape}, aug_state_kpts: {aug_state_kpts.shape}")
+    # print(f"action_kpts: {action_kpts.shape}, aug_action_kpts: {aug_action_kpts.shape}")
+    # Assemble new data
+    aug_data = {
+        "observation.images.front": aug_images,
+        "action": aug_action_kpts[:, 0].reshape(-1, 2),  # only origin
+        "action_is_pad": data["action_is_pad"],
+        "observation.camera_ext.front": data["observation.camera_ext.front"],
+        "observation.camera_int.front": data["observation.camera_int.front"],
+        "observation.state": aug_state_kpts.reshape(-1, 8),
+        "gripper_open": data["action"][:, -1] >= 0.02,
+        "origin": aug_action_kpts[:, 0],
+        "xaxis": aug_action_kpts[:, 1],
+        "yaxis": aug_action_kpts[:, 2],
+        "zaxis": aug_action_kpts[:, 3],
+    }
+    return aug_data
 
 
 if __name__ == "__main__":
@@ -446,7 +570,7 @@ if __name__ == "__main__":
         "observation.camera_ext.front": [0.0],
         "observation.camera_int.front": [0.0],
         "observation.state": [0.0],
-        "action": [0.0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24, 0.28, 0.32, 0.36, 0.4, 0.44, 0.48, 0.52, 0.56, 0.60],
+        "action": [0.04 * i for i in range(16)],
     }
 
     dataset = LeRobotDataset(
@@ -455,19 +579,68 @@ if __name__ == "__main__":
         delta_timestamps=delta_timestamps,
         image_transforms=None,
         video_backend="pyav",
-        root="/home/harvey/Project/LGMCTSpp/log/Oct_18_1",
+        root=".",
     )
-    data_loader = torch.utils.data.DataLoader(dataset, batch_size=16, num_workers=0)
-    batch = next(iter(data_loader))
-    model = ARPNetwork(action_from_glb_only=True, horizon=16, num_guide_points=15)
+    data = dataset[0]
+    horizon = len(data["action"])
+    intrinsics = data["observation.camera_int.front"][0].reshape(3, 3).numpy().astype(np.float64)
+    extrinsics = data["observation.camera_ext.front"][0].reshape(4, 4).numpy().astype(np.float64)
+    extrinsics = np.linalg.inv(extrinsics)
+    extrinsics[0] = -extrinsics[0]
+    aug_transform = augmentation_recipe(spatial=1.0, color=0.0, mask=1.0, hflip=0, vflip=0, normalize=True, keypoints=True, to_tensor=True)
+
+    rotations = Rotation.from_euler("xyz", data["action"][:, 3:6], degrees=False)
+    pose7 = np.concatenate([data["action"][:, :3], rotations.as_quat()], axis=1)
+    frames = pose7_to_frame(pose7)
+    frames2d = cv2.projectPoints(frames.reshape(-1, 3), extrinsics[:3, :3], extrinsics[:3, 3], intrinsics, None)[0].reshape(horizon, 4, 2)
+
+    # # THIS IMAGE is ranged in [0...1], or [0...255]
+    _ = aug_transform(image=data["observation.images.front"][0].permute(1, 2, 0).numpy(), keypoints=frames2d.reshape(-1, 2))
+    aug_image = _["image"]
+    aug_frames2d = _["keypoints"].reshape(horizon, 4, 2)
+    aug_frames2d = torch.from_numpy(aug_frames2d.clip(0, 511))
+    frames2d = torch.from_numpy(frames2d)
+
+    origin_batch = {
+        "observation.images.front": normalize_bchw_image(data["observation.images.front"])[None],
+        "action_is_pad": data["action_is_pad"][None],
+        "gripper_open": data["action"][None, :, -1] >= 0.02,
+        "origin": frames2d[None, :, 0],
+        "xaxis": frames2d[None, :, 1],
+        "yaxis": frames2d[None, :, 2],
+        "zaxis": frames2d[None, :, 3],
+    }
+
+    aug_batch = {
+        "observation.images.front": aug_image[None, None],
+        "action_is_pad": data["action_is_pad"][None],
+        "gripper_open": data["action"][None, :, -1] >= 0.02,
+        "origin": aug_frames2d[None, :, 0],
+        "xaxis": aug_frames2d[None, :, 1],
+        "yaxis": aug_frames2d[None, :, 2],
+        "zaxis": aug_frames2d[None, :, 3],
+    }
+
+    batch = {}
+    for k in origin_batch.keys():
+        batch[k] = torch.cat([origin_batch[k], aug_batch[k]], dim=0)
+
+    model = ARPNetwork(horizon=16)
     model.train()
 
     print("=== Training ===")
     log_dict = model(batch)
+    for i, img in enumerate(log_dict["visualized_images"]):
+        img.save(f"vis{i}.jpg")
+
     print(log_dict)
 
     print("=== Inference ===")
+    for k in ["action_is_pad", "gripper_open", "origin", "xaxis", "yaxis", "zaxis"]:
+        batch.pop(k)
+
     with torch.no_grad():
         model.eval()
-        pred_action = model(batch)
-    print(pred_action)
+        out = model(batch)
+        for i, img in enumerate(out["visualized_images"]):
+            img.save(f"vis{i}.eval.jpg")

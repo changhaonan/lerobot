@@ -64,8 +64,8 @@ def get_policy_and_config_classes(name: str) -> tuple[Policy, object]:
         # from lerobot.common.policies.arp.network import ARPConfig
         # from lerobot.common.policies.arp.network import ARPPolicy
         # Get version 4
-        from lerobot.common.policies.arp.network_v4 import ARPConfig
-        from lerobot.common.policies.arp.network_v4 import ARPPolicy
+        from lerobot.common.policies.arp.network import ARPConfig
+        from lerobot.common.policies.arp.network import ARPPolicy
 
         return ARPPolicy, ARPConfig
     else:
