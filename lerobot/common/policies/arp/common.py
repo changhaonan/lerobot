@@ -380,8 +380,9 @@ def normalize_bchw_image(x, scaler=255):
     return (x - pixel_mean[None, :, None, None]) / pixel_std[None, :, None, None]
 
 
-def pose7_to_frame(pose, scale=0.1):
+def pose7_to_frame(pose, scale=0.5):
     pose = pose.copy()
     R = Rotation.from_quat(pose[:, 3:]).as_matrix() * scale
+    R = np.transpose(R, (0, 2, 1))
     t = pose[:, :3]
     return np.concatenate([t[:, None, :], R + t[:, None, :]], axis=1)
