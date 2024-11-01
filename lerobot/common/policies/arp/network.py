@@ -457,8 +457,10 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
 # count = 0
 
 
-def ImageActionAug(data, aug_prob=0.5, target_size=None):
-    """Project action to image-points."""
+def ImageActionAug(data, aug_prob=0.5, target_size=None, action_rep="origin"):
+    """Project action to image-points.
+    action_rep: action representation. "origin" or "origin+depth" or "origin+depth+rot".
+    """
     horizon = len(data["action"])
     intrinsics = data["observation.camera_int.front"].reshape(3, 3).numpy().astype(np.float64)
     extrinsics = data["observation.camera_ext.front"].reshape(4, 4).numpy().astype(np.float64)
@@ -466,24 +468,12 @@ def ImageActionAug(data, aug_prob=0.5, target_size=None):
     extrinsics[0] = -extrinsics[0]
     n_obs = data["observation.images.front"].shape[0]
     additional_targets = {f"image{i}": "image" for i in range(1, n_obs)}
-    # aug_transform = augmentation_recipe(
-    #     target_size=target_size,
-    #     spatial=aug_prob if aug_prob > 0 else 0.0,
-    #     color=0.0,
-    #     mask=aug_prob if aug_prob > 0 else 0.0,
-    #     hflip=0,
-    #     vflip=0,
-    #     normalize=True,
-    #     keypoints=True,
-    #     to_tensor=True,
-    #     additional_targets=additional_targets,
-    # )
     aug_transform = augmentation_recipe(
         target_size=target_size,
-        spatial=0.0,
+        spatial=aug_prob if aug_prob > 0 else 0.0,
         color=0.0,
-        mask=0.0,
-        hflip=0,
+        mask=aug_prob if aug_prob > 0 else 0.0,
+        hflip=aug_prob if aug_prob > 0 else 0.0,
         vflip=0,
         normalize=True,
         keypoints=True,
@@ -494,8 +484,8 @@ def ImageActionAug(data, aug_prob=0.5, target_size=None):
     # kpts in actions.
     action_rots = Rotation.from_euler("XYZ", data["action"][:, 3:6], degrees=False)
     action_pose7d = np.concatenate([data["action"][:, :3], action_rots.as_quat()], axis=1)
-    action_kpts = pose7_to_frame(action_pose7d)
-    action_kpts = cv2.projectPoints(action_kpts.reshape(-1, 3), extrinsics[:3, :3], extrinsics[:3, 3], intrinsics, None)[0].reshape(horizon, 4, 2)
+    action_kpts_3d = pose7_to_frame(action_pose7d)  # 3d keypoints
+    action_kpts = cv2.projectPoints(action_kpts_3d.reshape(-1, 3), extrinsics[:3, :3], extrinsics[:3, 3], intrinsics, None)[0].reshape(horizon, 4, 2)
     num_action_kpts = action_kpts.shape[0]
     # kpts in states.
     state_rots = Rotation.from_euler("XYZ", data["observation.state"][:, 3:6], degrees=False)
@@ -544,9 +534,31 @@ def ImageActionAug(data, aug_prob=0.5, target_size=None):
     # print(f"state_kpts: {state_kpts.shape}, aug_state_kpts: {aug_state_kpts.shape}")
     # print(f"action_kpts: {action_kpts.shape}, aug_action_kpts: {aug_action_kpts.shape}")
     # Assemble new data
+    # Assemble action
+    action_chunks = action_rep.split("+")
+    actions = []
+    for chunk in action_chunks:
+        if chunk == "origin":
+            actions.append(aug_action_kpts[:, 0].reshape(-1, 2))  # (H, 2)
+        elif chunk == "xyzaxis":
+            # x, y, z axis
+            actions.append(aug_action_kpts[:, 1:].reshape(-1, 6))
+        elif chunk == "depth":
+            # depth
+            action_kpts_d = (extrinsics[:3, :3] @ action_kpts_3d.T + extrinsics[:3, 3:4])[:, 2].T
+            action_kpts_d = torch.from_numpy(action_kpts_d).reshape(-1, 1)
+            actions.append(action_kpts_d)  # (H, 1)
+        elif chunk == "rot":
+            # rotation
+            action_rots = data["action"][:, 3:6]
+            actions.append(action_rots)  # (H, 3)
+        elif chunk == "gripper":
+            # gripper
+            actions.append(data["action"][:, -1].reshape(-1, 1))
+    actions = torch.concat(actions, dim=-1)
     aug_data = {
         "observation.images.front": aug_images,
-        "action": aug_action_kpts[:, 0].reshape(-1, 2),  # only origin
+        "action": actions,  # only origin
         "action_is_pad": data["action_is_pad"],
         "observation.camera_ext.front": data["observation.camera_ext.front"],
         "observation.camera_int.front": data["observation.camera_int.front"],

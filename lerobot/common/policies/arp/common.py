@@ -195,7 +195,7 @@ def draw_kps_horizon(
     kpts_horizon: torch.Tensor,
     connectivity: list[tuple[int, int]] | None = None,
     colors: list[tuple[int, int, int]] | tuple[int, int, int] = (255, 0, 0),
-    kp_colors: list[tuple[int, int, int]] | tuple[int, int, int] = [(255, 0, 0), (0, 255, 0), (0, 0, 255)],
+    kp_colors: list[tuple[int, int, int]] | tuple[int, int, int] = [(255, 255, 255), (255, 0, 0), (0, 255, 0), (0, 0, 255)],
     radius: int = 1,
     width: int = 3,
     output_pil=True,
@@ -218,8 +218,8 @@ def draw_kps_horizon(
             image = image.permute(2, 0, 1)
 
     POINT_SIZE = kpts_horizon.shape[-1]
-    NUM_KPS = kpts_horizon.shape[0]
-    HORIZON = kpts_horizon.shape[1]
+    NUM_KPS = kpts_horizon.shape[1]
+    HORIZON = kpts_horizon.shape[0]
     kpts_horizon = kpts_horizon.reshape(HORIZON, NUM_KPS, POINT_SIZE)
     ndarr = image.permute(1, 2, 0).cpu().numpy()
     img_to_draw = Image.fromarray(ndarr)
@@ -231,6 +231,20 @@ def draw_kps_horizon(
 
     for horizon_id, kpts in enumerate(img_kpts_horizon):
         transparency = (horizon_id / HORIZON) * 0.5
+        # draw lines within one frame
+        if connectivity is not None:
+            for connection in connectivity:
+                start_pt_x = kpts[connection[0]][0]
+                start_pt_y = kpts[connection[0]][1]
+
+                end_pt_x = kpts[connection[1]][0]
+                end_pt_y = kpts[connection[1]][1]
+
+                if not is_valid(start_pt_x, start_pt_y, end_pt_x, end_pt_y):
+                    continue
+
+                kp_line_color = (255, 255, 255) + (int(255 * (1 - transparency)),)
+                draw.line(((start_pt_x, start_pt_y), (end_pt_x, end_pt_y)), width=1, fill=kp_line_color)
         for kpt_id, kpt_inst in enumerate(kpts):
             kpt_size = len(kpt_inst)
             if kpt_size == 2:
@@ -244,20 +258,7 @@ def draw_kps_horizon(
             y2 = kpt_inst[1] + radius
             kp_color = kp_colors[kpt_id % len(kp_colors)] + (int(255 * (1 - transparency)),)
             draw.ellipse([x1, y1, x2, y2], fill=kp_color, outline=None, width=0)
-            # draw lines within one frame
-            if connectivity is not None:
-                for connection in connectivity:
-                    start_pt_x = kpt_inst[connection[0]][0]
-                    start_pt_y = kpt_inst[connection[0]][1]
 
-                    end_pt_x = kpt_inst[connection[1]][0]
-                    end_pt_y = kpt_inst[connection[1]][1]
-
-                    if not is_valid(start_pt_x, start_pt_y, end_pt_x, end_pt_y):
-                        continue
-
-                    kp_line_color = colors + (int(255 * (1 - transparency)),)
-                    draw.line(((start_pt_x, start_pt_y), (end_pt_x, end_pt_y)), width=width, fill=kp_line_color)
     # # draw lines across frames, connecting the same keypoint across different frames
     # for keypoint_id in range(NUM_KPS):
     #     for horizon_id in range(HORIZON - 1):
