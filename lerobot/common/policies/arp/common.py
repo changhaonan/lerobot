@@ -196,7 +196,7 @@ def draw_kps_horizon(
     connectivity: list[tuple[int, int]] | None = None,
     colors: list[tuple[int, int, int]] | tuple[int, int, int] = (255, 0, 0),
     kp_colors: list[tuple[int, int, int]] | tuple[int, int, int] = [(255, 255, 255), (255, 0, 0), (0, 255, 0), (0, 0, 255)],
-    radius: int = 1,
+    radius: int = 2,
     width: int = 3,
     output_pil=True,
     line_under=True,
