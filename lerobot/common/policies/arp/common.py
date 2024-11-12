@@ -240,8 +240,8 @@ def draw_kps_horizon(
                 end_pt_x = kpts[connection[1]][0]
                 end_pt_y = kpts[connection[1]][1]
 
-                if not is_valid(start_pt_x, start_pt_y, end_pt_x, end_pt_y):
-                    continue
+                # if not is_valid(start_pt_x, start_pt_y, end_pt_x, end_pt_y):
+                #     continue
 
                 kp_line_color = (255, 255, 255) + (int(255 * (1 - transparency)),)
                 draw.line(((start_pt_x, start_pt_y), (end_pt_x, end_pt_y)), width=1, fill=kp_line_color)
