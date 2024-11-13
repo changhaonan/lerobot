@@ -422,8 +422,15 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
         if len(self._queues["action"]) == 0:
             # stack n latest observations from the queue
             batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-            actions = self.model(batch)["action"]
-
+            output = self.model(batch)
+            actions = output["action"]
+            # [DEBUG]
+            visualized_images = output.get("visualized_images", None)
+            hand_visualized_images = output.get("hand_visualized_images", None)
+            for i, img in enumerate(visualized_images):
+                img.save(f"vis{i}_front.jpg")
+            for i, img in enumerate(hand_visualized_images):
+                img.save(f"vis{i}_hand.jpg")
             # Chunk action
             actions = self.unnormalize_outputs({"action": actions})["action"]
             start = 0
