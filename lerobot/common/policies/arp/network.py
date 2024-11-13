@@ -158,10 +158,16 @@ class ARPNetwork(nn.Module):
         """
         horizon = self.horizon
         # Convert original batch to action in image.
-        dev = batch["observation.images.front"].device
-
-        images = batch["observation.images.front"][:, 0]  # [bs, 3, H, W]
-        hand_images = batch["observation.images.hand"][:, 0]  # [bs, 3, H, W]
+        image_keys = ["front", "hand"]
+        # split images into keys
+        if "observation.images.front" in batch:
+            dev = batch["observation.images.front"].device
+            images = batch["observation.images.front"][:, 0]  # [bs, 3, H, W]
+            hand_images = batch["observation.images.hand"][:, 0]  # [bs, 3, H, W]
+        else:
+            dev = batch["observation.images"].device
+            images = batch["observation.images"][:, 0, 0]  # [bs, 3, H, W]
+            hand_images = batch["observation.images"][:, 0, 1]  # [bs, 3, H, W]
 
         H, W = images.shape[-2:]
         bs = images.shape[0]
