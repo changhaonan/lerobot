@@ -268,6 +268,7 @@ class ARPNetwork(nn.Module):
             keypoints = pred_tks[:, : self.horizon * 2, :2] * self.visual_guide_downsample
 
             images = denormalize_bchw_image(images)
+            hand_images = denormalize_bchw_image(hand_images)
 
             visualized_images = []
             hand_visualized_images = []
@@ -275,14 +276,14 @@ class ARPNetwork(nn.Module):
             # observe the first 16 images
             for bi in range(min(bs, 16)):
                 img = to_pil_image(images[bi] / 255.0)
-                img = draw_keypoints(img, keypoints[bi, 0::2].detach().cpu() * self.visual_guide_downsample, colors=(255, 0, 0))
+                img = draw_keypoints(img, keypoints[bi, 0::2].detach().cpu(), colors=(255, 0, 0))
                 if "action_2d.front" in batch:
                     gt_keypoints = batch["action_2d.front"]
                     img = draw_keypoints(img, gt_keypoints[bi].detach().cpu() * self.visual_guide_downsample, colors=(0, 255, 0))
                 visualized_images.append(img)
 
                 img = to_pil_image(hand_images[bi] / 255.0)
-                img = draw_keypoints(img, keypoints[bi, 1::2].detach().cpu() * self.visual_guide_downsample, colors=(255, 0, 0))
+                img = draw_keypoints(img, keypoints[bi, 1::2].detach().cpu(), colors=(255, 0, 0))
                 if "action_2d.hand" in batch:
                     gt_keypoints = batch["action_2d.hand"]
                     img = draw_keypoints(img, gt_keypoints[bi].detach().cpu() * self.visual_guide_downsample, colors=(0, 255, 0))
