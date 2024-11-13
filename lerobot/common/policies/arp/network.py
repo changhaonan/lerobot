@@ -82,9 +82,16 @@ class ARPNetwork(nn.Module):
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
             self.visual_input_proj = nn.Conv2d(backbone_model.fc.in_features, dim_model, kernel_size=1)
         elif backbones == "vit":
-            lora_config = LoraConfig(target_modules=["fc1", "fc2", "query", "value", "key", "dense", "projection"])
+            freeze_backbone = True
             dinov2 = Dinov2Model.from_pretrained(f"facebook/dinov2-small")
-            self.backbone = get_peft_model(dinov2, lora_config)
+            if not freeze_backbone:
+                lora_config = LoraConfig(target_modules=["fc1", "fc2", "query", "value", "key", "dense", "projection"])
+                self.backbone = get_peft_model(dinov2, lora_config)
+            else:
+                self.backbone = dinov2
+                # freeze the backbone
+                for param in self.backbone.parameters():
+                    param.requires_grad = False
             self.visual_input_proj = nn.Conv2d(self.backbone.config.hidden_size, dim_model, 1, 1, 0)
             self.hand_visual_input_proj = nn.Conv2d(self.backbone.config.hidden_size, dim_model, 1, 1, 0)
         else:
