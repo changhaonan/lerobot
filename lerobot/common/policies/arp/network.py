@@ -85,7 +85,8 @@ class ARPNetwork(nn.Module):
             lora_config = LoraConfig(target_modules=["fc1", "fc2", "query", "value", "key", "dense", "projection"])
             dinov2 = Dinov2Model.from_pretrained(f"facebook/dinov2-small")
             self.backbone = get_peft_model(dinov2, lora_config)
-            self.visual_input_proj = nn.Linear(self.backbone.config.hidden_size, dim_model)
+            self.visual_input_proj = nn.Conv2d(self.backbone.config.hidden_size, dim_model, 1, 1, 0)
+            self.hand_visual_input_proj = nn.Conv2d(self.backbone.config.hidden_size, dim_model, 1, 1, 0)
         else:
             raise ValueError(f"Backbone {backbones} is not supported.")
         self.encoder = nn.TransformerEncoder(
@@ -102,6 +103,7 @@ class ARPNetwork(nn.Module):
             norm=nn.LayerNorm(dim_model),
         )
         self.visual_pos_embed = SinusoidalPositionEmbedding2d(dim_model // 2)
+        self.hand_visual_pos_embed = SinusoidalPositionEmbedding2d(dim_model // 2)
         self.cls_embed = nn.Embedding(1, dim_model)
         self.cls_pos_embed = nn.Embedding(1, dim_model)
 
@@ -125,37 +127,25 @@ class ARPNetwork(nn.Module):
                 * n_arp_layers,
                 tokens=[
                     arp.TokenType.make(
-                        name="init",
+                        name="visual",
                         is_continuous=True,
                         dim=2,
                         embedding="position_2d",
                         predictor="upsample_from_2d_attn",
                         predictor_kwargs={
-                            "attn_with": f"visual-featmap@init",
+                            "attn_with": f"visual-featmap",
                             "upscale_ratio": stride // visual_guide_downsample,
-                            "label_name": f"smooth-heatmap@init",
+                            "label_name": f"smooth-heatmap",
                         },
                     ),
-                    arp.TokenType.make(
-                        name="rest",
-                        is_continuous=True,
-                        dim=2,
-                        embedding="position_2d",
-                        predictor="upsample_from_2d_attn",
-                        predictor_kwargs={
-                            "attn_with": f"visual-featmap@rest",
-                            "upscale_ratio": stride // visual_guide_downsample,
-                            "label_name": f"smooth-heatmap@rest",
-                        },
-                    ),
-                    arp.TokenType.make(name="gripper", is_continuous=False, dim=1, dict_sizes=[2], embedding="discrete", predictor="class"),
+                    # arp.TokenType.make(name="action_2d", is_continuous=True, dim=7, embedding="linear", predictor="gmm"),
+                    arp.TokenType.make(name="action", is_continuous=True, dim=7, embedding="linear", predictor="gmm"),
                 ],
             )
         )
         self.visual_guide_downsample = visual_guide_downsample
         self.reverse_plan = reverse_plan
         self.horizon = horizon
-        self.initial_chunk_size = initial_chunk_size
 
     def forward(self, batch):
         """
@@ -171,72 +161,72 @@ class ARPNetwork(nn.Module):
         dev = batch["observation.images.front"].device
 
         images = batch["observation.images.front"][:, 0]  # [bs, 3, H, W]
+        hand_images = batch["observation.images.hand"][:, 0]  # [bs, 3, H, W]
+
         H, W = images.shape[-2:]
         bs = images.shape[0]
         fw, fh = W // 14, H // 14
         visual_features = self.backbone(images).last_hidden_state
+        hand_visual_features = self.backbone(hand_images).last_hidden_state
+
         visual_feature_map = visual_features[:, 1:, :].permute(0, 2, 1).reshape(bs, -1, fh, fw)
+        hand_visual_feature_map = hand_visual_features[:, 1:, :].permute(0, 2, 1).reshape(bs, -1, fh, fw)
+
         # bs, _, fh, fw = visual_features.shape
         visual_pos_embed = self.visual_pos_embed(visual_feature_map).to(dtype=visual_features.dtype)
-        visual_features = self.visual_input_proj(visual_features)
+        hand_visual_pos_embed = self.hand_visual_pos_embed(hand_visual_feature_map).to(dtype=hand_visual_features.dtype)
 
-        encoder_in = torch.cat([self.cls_embed.weight.unsqueeze(1).repeat(1, bs, 1), rearrange(visual_feature_map, "b c h w -> (h w) b c")])
-        pos_embed = torch.cat([self.cls_pos_embed.weight.unsqueeze(1), visual_pos_embed.flatten(2).permute(2, 0, 1)])
+        visual_feature_map = self.visual_input_proj(visual_feature_map)
+        hand_visual_feature_map = self.hand_visual_input_proj(hand_visual_feature_map)
+
+        encoder_in = torch.cat(
+            [
+                self.cls_embed.weight.unsqueeze(1).repeat(1, bs, 1),
+                rearrange(visual_feature_map, "b c h w -> (h w) b c"),
+                rearrange(hand_visual_feature_map, "b c h w -> (h w) b c"),
+            ]
+        )
+        pos_embed = torch.cat(
+            [self.cls_pos_embed.weight.unsqueeze(1), visual_pos_embed.flatten(2).permute(2, 0, 1), hand_visual_pos_embed.flatten(2).permute(2, 0, 1)]
+        )
 
         encoder_out = self.encoder(encoder_in + pos_embed)
-        encoder_out = encoder_out.permute(1, 0, 2)  # (B, fh*fw, C)
-        visual_featmap = encoder_out[:, 1:, :].permute(0, 2, 1).reshape(bs, 1, -1, fh, fw)
+        encoder_out = encoder_out.permute(1, 0, 2)  # (B, 2*fh*fw, C)
+        visual_featmap = encoder_out[:, 1:, :].permute(0, 2, 1).reshape(bs, -1, 2, fh, fw).permute(0, 2, 1, 3, 4)  # (B, 2, C, H, W)
         visual_tokens = encoder_out
 
         name2id = self.policy.token_name_2_ids
-        tk_names = (
-            [
-                "init",
-            ]
-            * 4
-            * self.initial_chunk_size
-            + ["rest"] * 4 * (horizon - self.initial_chunk_size)
-            + ["gripper"] * horizon
-        )
+        tk_names = [
+            "visual",
+        ] * 2 * horizon + ["action"] * horizon
         tk_ids = [name2id[name] for name in tk_names]
+
         # Devide the rest into multiple chunks
-        chk_ids = [0] * 4 * self.initial_chunk_size
-        num_reset_chunk = 4
-        assert (horizon - self.initial_chunk_size) % num_reset_chunk == 0, "The horizon should be divisible by num_reset_chunk"
-        for i in range(num_reset_chunk):
-            chk_ids += [1 + i] * (4 * ((horizon - self.initial_chunk_size) // num_reset_chunk))
-        chk_ids += [chk_ids[-1] + 1] * (horizon - len(chk_ids) // 4) * 4
-        chk_ids += [chk_ids[-1] + 1] * horizon
+        visual_chk_size = horizon
+        chk_ids = [0] * 2 * visual_chk_size + [1] * horizon
+
+        if "action_2d.front" in batch:
+            vH, vW = H // self.visual_guide_downsample, W // self.visual_guide_downsample
+            for k in ["action_2d.front", "action_2d.hand"]:
+                v = batch[k].clone()
+                v += 1
+                v /= 2
+                v *= torch.tensor([vW, vH], device=dev)
+                batch[k] = v
 
         if self.training:
-            assert horizon == batch["origin"].shape[1]
             if self.reverse_plan:
-                for k in ["origin", "xaxis", "yaxis", "zaxis"]:
+                for k in ["action_2d.front", "action_2d.hand"]:
                     batch[k] = torch.flip(batch[k], [1])
 
-            vH, vW = H // self.visual_guide_downsample, W // self.visual_guide_downsample
+            actions = [torch.cat([batch["action_2d.front"][:, :, None], batch["action_2d.hand"][:, :, None]], dim=2).flatten(1, 2), batch["action"]]
+            contexts = {
+                "visual-tokens": visual_tokens,
+                "visual-featmap": visual_featmap.repeat(1, horizon, 1, 1, 1).flatten(0, 1),
+                "smooth-heatmap": generate_heatmap_from_screen_pts(actions[0].flatten(0, 1), (vH, vW)).reshape(bs * 2 * horizon, 1, vH, vW),
+            }
 
-            actions = defaultdict(list)
-            contexts = defaultdict(list)
-            for k in ["origin", "xaxis", "yaxis", "zaxis"]:
-                visual_action = batch[k].float() / self.visual_guide_downsample
-                actions["init"].append(visual_action[:, : self.initial_chunk_size])
-                actions["rest"].append(visual_action[:, self.initial_chunk_size :])
-
-                heatmap = generate_heatmap_from_screen_pts(visual_action.flatten(0, 1), (vH, vW)).reshape(bs, horizon, 1, vH, vW)
-                contexts[f"smooth-heatmap@init"].append(heatmap[:, : self.initial_chunk_size])
-                contexts[f"smooth-heatmap@rest"].append(heatmap[:, self.initial_chunk_size :])
-
-            for k in ["init", "rest"]:
-                actions[k] = torch.cat([a[:, :, None, :] for a in actions[k]], dim=2)  # bs, L, 4, 2
-                hm = torch.cat(contexts[f"smooth-heatmap@{k}"], dim=2).flatten(1, 2)
-                contexts[f"smooth-heatmap@{k}"] = hm.flatten(0, 1)
-                contexts[f"visual-featmap@{k}"] = visual_featmap.repeat(1, hm.shape[1], 1, 1, 1).flatten(0, 1)
-
-            actions["gripper"] = batch["gripper_open"].unsqueeze(-1).repeat(1, 1, 2).float()
-            contexts["visual-tokens"] = visual_tokens
-
-            tk_vals = torch.cat([torch.cat([actions["init"], actions["rest"]], dim=1).flatten(1, 2), actions["gripper"]], dim=1)
+            tk_vals = arp.cat_uneven_blc_tensors(*actions)
             chk_ids = torch.as_tensor(chk_ids, device=dev)[None, :]
             tk_ids = torch.as_tensor(tk_ids).to(dev)[None, :, None].repeat(bs, 1, 1)
             tks = torch.cat([tk_vals, tk_ids], dim=-1)
@@ -245,14 +235,18 @@ class ARPNetwork(nn.Module):
             DEBUG = False
             if DEBUG:
                 images = denormalize_bchw_image(images)
-                visualized_images = []
+                hand_images = denormalize_bchw_image(hand_images)
+                visualized_images, hand_visualized_images = [], []
                 for bi in range(bs):
-                    img = to_pil_image(images[bi])
-                    img = draw_keypoints(
-                        img, torch.cat([actions["init"][bi, :, 0], actions["rest"][bi, :, 0]]).detach().cpu() * self.visual_guide_downsample
-                    )
+                    img = to_pil_image(images[bi] / 255.0)
+                    img = draw_keypoints(img, batch["action_2d.front"][bi].detach().cpu() * self.visual_guide_downsample)
                     visualized_images.append(img)
+
+                    img = to_pil_image(hand_images[bi] / 255.0)
+                    img = draw_keypoints(img, batch["action_2d.hand"][bi].detach().cpu() * self.visual_guide_downsample)
+                    hand_visualized_images.append(img)
                 loss_dict["visualized_images"] = visualized_images
+                loss_dict["hand_visualized_images"] = hand_visualized_images
             # Compute a sum loss
             loss_dict["loss"] = sum([v for k, v in loss_dict.items() if "loss" in k])
             return loss_dict
@@ -264,59 +258,40 @@ class ARPNetwork(nn.Module):
                 future_tk_chk_ids,
                 contexts={
                     "visual-tokens": visual_tokens,
-                    "visual-featmap@init": visual_featmap.repeat(1, 4 * self.initial_chunk_size, 1, 1, 1).flatten(0, 1),
-                    "visual-featmap@rest": visual_featmap.repeat(1, 4 * (horizon - self.initial_chunk_size) // num_reset_chunk, 1, 1, 1).flatten(
-                        0, 1
-                    ),
+                    "visual-featmap": visual_featmap.repeat(1, horizon, 1, 1, 1).flatten(0, 1),
                 },
-                sample=True,
+                sample=False,
             )
             # at this moment, the pred tks are visual actions only
-            pred_tks = pred_tks[:, : self.horizon * 4]
-            keypoints = pred_tks[:, ::4, :-1] * self.visual_guide_downsample
+            pred_tks = pred_tks[..., :-1]
+            pred_actions = pred_tks[:, self.horizon * 2 :]
+            keypoints = pred_tks[:, : self.horizon * 2, :2] * self.visual_guide_downsample
 
             images = denormalize_bchw_image(images)
 
-            RETURN_VIDEO = False
-            if RETURN_VIDEO:
-                random_id = random.randint(0, 100000)
-                video_dir = f"./tmp/arp_video/{random_id}"
-                os.makedirs(video_dir, exist_ok=True)
-            threads = []
             visualized_images = []
+            hand_visualized_images = []
+
             # observe the first 16 images
             for bi in range(min(bs, 16)):
-                img = to_pil_image(images[bi])
-                if not RETURN_VIDEO:
-                    img = draw_keypoints(img, keypoints[bi].detach().cpu(), colors=(255, 0, 0))
-                    # draw gt keypoints
-                    if "origin" in batch:
-                        gt_keypoints = batch["origin"]
-                        img = draw_keypoints(img, gt_keypoints[bi].detach().cpu(), colors=(0, 255, 0))
-                    visualized_images.append(img)
-                else:
-                    video_imgs = []
-                    for kp, gt_kp in zip(keypoints[bi].detach().cpu(), batch["origin"][bi].detach().cpu()):
-                        _img = deepcopy(img)
-                        _img = draw_keypoints(_img, kp[None], colors=(255, 0, 0))
-                        _img = draw_keypoints(_img, gt_kp[None], colors=(0, 255, 0))
-                        video_imgs.append(_img)
-                    # write video
-                    video_path = f"{video_dir}/{bi}.mp4"
-                    thread = threading.Thread(
-                        target=write_video,
-                        args=(str(video_path), video_imgs, 25),
-                    )
-                    thread.start()
-                    threads.append(thread)
-                    visualized_images.append(video_path)
+                img = to_pil_image(images[bi] / 255.0)
+                img = draw_keypoints(img, keypoints[bi, 0::2].detach().cpu() * self.visual_guide_downsample, colors=(255, 0, 0))
+                if "action_2d.front" in batch:
+                    gt_keypoints = batch["action_2d.front"]
+                    img = draw_keypoints(img, gt_keypoints[bi].detach().cpu() * self.visual_guide_downsample, colors=(0, 255, 0))
+                visualized_images.append(img)
 
-            if RETURN_VIDEO:
-                for thread in threads:
-                    thread.join()
+                img = to_pil_image(hand_images[bi] / 255.0)
+                img = draw_keypoints(img, keypoints[bi, 1::2].detach().cpu() * self.visual_guide_downsample, colors=(255, 0, 0))
+                if "action_2d.hand" in batch:
+                    gt_keypoints = batch["action_2d.hand"]
+                    img = draw_keypoints(img, gt_keypoints[bi].detach().cpu() * self.visual_guide_downsample, colors=(0, 255, 0))
+                hand_visualized_images.append(img)
+
             return {
-                "action": pred_tks,
+                "action": pred_actions,
                 "visualized_images": visualized_images,
+                "hand_visualized_images": hand_visualized_images,
             }
 
 
