@@ -406,6 +406,7 @@ class ARPPolicy(nn.Module, PyTorchModelHubMixin, library_name="lerobot", repo_ur
         if len(self.expected_image_keys) > 0:
             batch = dict(batch)
             batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
+        batch = self.normalize_targets(batch)
         log_dict = self.model(batch)
         return log_dict
 
