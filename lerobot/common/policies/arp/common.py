@@ -386,3 +386,16 @@ def pose7_to_frame(pose, scale=0.5):
     R = np.transpose(R, (0, 2, 1))
     t = pose[:, :3]
     return np.concatenate([t[:, None, :], R + t[:, None, :]], axis=1)
+
+
+def pose7_to_frame_aim(pose, scale=0.1, depth=0.15):
+    pose = pose.copy()
+    R = Rotation.from_quat(pose[:, 3:]).as_matrix()
+    R = np.transpose(R, (0, 2, 1))
+    t = pose[:, :3]
+    aim_points = []
+    aim_points.append(t[:, None, :] + R[:, :, 2] * depth + scale * R[:, :, 0] + scale * R[:, :, 1])
+    aim_points.append(t[:, None, :] + R[:, :, 2] * depth + scale * R[:, :, 0] - scale * R[:, :, 1])
+    aim_points.append(t[:, None, :] + R[:, :, 2] * depth - scale * R[:, :, 0] - scale * R[:, :, 1])
+    aim_points.append(t[:, None, :] + R[:, :, 2] * depth - scale * R[:, :, 0] + scale * R[:, :, 1])
+    return np.concatenate(aim_points, axis=1)
