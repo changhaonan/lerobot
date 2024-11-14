@@ -109,6 +109,8 @@ class ARPNetwork(nn.Module):
             num_layers=n_encoder_layers,
             norm=nn.LayerNorm(dim_model),
         )
+        self.state_proj = nn.Linear(7, dim_model)
+        self.state_pos_embed = nn.Embedding(1, dim_model)
         self.visual_pos_embed = SinusoidalPositionEmbedding2d(dim_model // 2)
         self.hand_visual_pos_embed = SinusoidalPositionEmbedding2d(dim_model // 2)
         self.cls_embed = nn.Embedding(1, dim_model)
@@ -157,6 +159,7 @@ class ARPNetwork(nn.Module):
     def forward(self, batch):
         """
         observation.images.front: (bs, 1, 3, H, W)
+        observation.states: (bs, 1, 2)
         action_is_pad: (bs, L)
 
         # label
@@ -192,20 +195,27 @@ class ARPNetwork(nn.Module):
         visual_feature_map = self.visual_input_proj(visual_feature_map)
         hand_visual_feature_map = self.hand_visual_input_proj(hand_visual_feature_map)
 
+        state_feature = self.state_proj(batch["observation.state"])
         encoder_in = torch.cat(
             [
                 self.cls_embed.weight.unsqueeze(1).repeat(1, bs, 1),
+                rearrange(state_feature, "b h c -> h b c"),
                 rearrange(visual_feature_map, "b c h w -> (h w) b c"),
                 rearrange(hand_visual_feature_map, "b c h w -> (h w) b c"),
             ]
         )
         pos_embed = torch.cat(
-            [self.cls_pos_embed.weight.unsqueeze(1), visual_pos_embed.flatten(2).permute(2, 0, 1), hand_visual_pos_embed.flatten(2).permute(2, 0, 1)]
+            [
+                self.cls_pos_embed.weight.unsqueeze(1),
+                self.state_pos_embed.weight.unsqueeze(1),
+                visual_pos_embed.flatten(2).permute(2, 0, 1),
+                hand_visual_pos_embed.flatten(2).permute(2, 0, 1),
+            ]
         )
 
         encoder_out = self.encoder(encoder_in + pos_embed)
         encoder_out = encoder_out.permute(1, 0, 2)  # (B, 2*fh*fw, C)
-        visual_featmap = encoder_out[:, 1:, :].permute(0, 2, 1).reshape(bs, -1, 2, fh, fw).permute(0, 2, 1, 3, 4)  # (B, 2, C, H, W)
+        visual_featmap = encoder_out[:, 2:, :].permute(0, 2, 1).reshape(bs, -1, 2, fh, fw).permute(0, 2, 1, 3, 4)  # (B, 2, C, H, W)
         visual_tokens = encoder_out
 
         name2id = self.policy.token_name_2_ids
